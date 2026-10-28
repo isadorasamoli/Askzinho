@@ -22,7 +22,10 @@ import {
   StringSelectMenuBuilder,
 } from 'discord.js';
 import { DisTube } from 'distube';
+import { SoundCloudPlugin } from '@distube/soundcloud';
+import { SpotifyPlugin } from '@distube/spotify';
 import { YouTubePlugin } from '@distube/youtube';
+import ffmpegPath from 'ffmpeg-static';
 
 const BOT_NAME = "Askzinho";
 const PORT = Number(process.env.PORT) || 10000;
@@ -129,9 +132,47 @@ keepAliveServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[${BOT_NAME}] Keep-Alive HTTP ativo em 0.0.0.0:${PORT} (/health pronto para Render e UptimeRobot)`);
 });
 
+// DisTube configurado para nuvem (Render):
+// 1. Usa o binário do ffmpeg-static diretamente (o Render Free não traz ffmpeg global)
+// 2. Prioriza SoundCloud + Spotify nas buscas para evitar bloqueio de IP de datacenter do YouTube
 const distube = new DisTube(client, {
   emitNewSongOnly: true,
-  plugins: [new YouTubePlugin()],
+  ffmpeg: {
+    path: ffmpegPath,
+  },
+  plugins: [
+    new SoundCloudPlugin(),
+    new SpotifyPlugin(),
+    new YouTubePlugin(),
+  ],
+});
+
+distube.on('playSong', (queue, song) => {
+  queue.textChannel
+    ?.send(`Tocando agora na call: **${song.name}** (`${song.formattedDuration}`)`)
+    .catch(() => {});
+});
+
+distube.on('addSong', (queue, song) => {
+  if (queue.songs.length > 1) {
+    queue.textChannel
+      ?.send(`Adicionada na fila (#${queue.songs.length - 1}): **${song.name}** (`${song.formattedDuration}`)`)
+      .catch(() => {});
+  }
+});
+
+distube.on('error', (arg1, arg2) => {
+  const err = arg1 instanceof Error ? arg1 : arg2;
+  const ctx = arg1 instanceof Error ? arg2 : arg1;
+  const channel = ctx?.textChannel || (typeof ctx?.send === 'function' ? ctx : null);
+  console.error(`[${BOT_NAME}] Erro no DisTube:`, err);
+  if (channel) {
+    channel
+      .send(
+        `Não consegui tocar essa faixa (`${err?.message || 'erro de stream'}`). Dica: busque pelo **nome da música** ou link do Spotify/SoundCloud!`
+      )
+      .catch(() => {});
+  }
 });
 
 async function sendAuditLog(guild, { category, action, actorTag, target, reason, before, after }) {
@@ -303,11 +344,18 @@ client.on('messageCreate', async (message) => {
       });
       return message.reply('Essa música contém palavras bloqueadas nas regras da call.');
     }
-    await distube.play(voiceChannel, query, {
-      member: message.member,
-      textChannel: message.channel,
-      message,
-    });
+    try {
+      await distube.play(voiceChannel, query, {
+        member: message.member,
+        textChannel: message.channel,
+        message,
+      });
+    } catch (err) {
+      console.error(`[${BOT_NAME}] Falha no !play:`, err);
+      return message.reply(
+        'Não foi possível carregar esse link direto (o YouTube costuma bloquear servidores na nuvem). Tente digitar **!play nome da música e artista**!'
+      );
+    }
   }
 
   if (cmd === 'playlist') {
@@ -319,13 +367,18 @@ client.on('messageCreate', async (message) => {
     if (!foundKey) {
       return message.reply(`Playlists disponíveis: ${Object.keys(CUSTOM_PLAYLISTS).join(' · ')}`);
     }
-    for (const trackQuery of CUSTOM_PLAYLISTS[foundKey]) {
-      await distube.play(voiceChannel, trackQuery, {
-        member: message.member,
-        textChannel: message.channel,
-      });
+    try {
+      for (const trackQuery of CUSTOM_PLAYLISTS[foundKey]) {
+        await distube.play(voiceChannel, trackQuery, {
+          member: message.member,
+          textChannel: message.channel,
+        });
+      }
+      return message.reply(`Playlist **${foundKey}** adicionada à call!`);
+    } catch (err) {
+      console.error(`[${BOT_NAME}] Falha na playlist:`, err);
+      return message.reply('Erro ao carregar uma das faixas da playlist na call.');
     }
-    return message.reply(`Playlist **${foundKey}** adicionada à call!`);
   }
 
   if (cmd === 'skip' || cmd === 's') {
@@ -476,11 +529,19 @@ client.on('interactionCreate', async (interaction) => {
         ephemeral: true,
       });
     }
-    await interaction.reply(`Buscando e tocando **${search}** na call **${voiceChannel.name}**...`);
-    await distube.play(voiceChannel, search, {
-      member: interaction.member,
-      textChannel: interaction.channel,
-    });
+    await interaction.deferReply();
+    try {
+      await distube.play(voiceChannel, search, {
+        member: interaction.member,
+        textChannel: interaction.channel,
+      });
+      await interaction.editReply(` Pedido enviado para a call **${voiceChannel.name}**: **${search}**`);
+    } catch (err) {
+      console.error(`[${BOT_NAME}] Falha no /play:`, err);
+      await interaction.editReply(
+        'Não consegui abrir esse link (o YouTube costuma bloquear IPs do Render). Tente mandar apenas o **nome da música e artista**!'
+      );
+    }
   }
 
   if (interaction.commandName === 'modskip') {
