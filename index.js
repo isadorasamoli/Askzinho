@@ -30,7 +30,7 @@ const PREFIX = "!";
 const REQUEST_CHANNEL_NAME = "🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞";
 const RANKUP_CHANNEL_NAME = "upou-de-elo";
 const MODLOG_CHANNEL_NAME = "auditoria-mod";
-const BLOCKED_TERMS = ["estourado","gemidao","999db","proibidão","dmca strike"];
+const BLOCKED_TERMS = ["estourado","gemidao","999db","proibidão","áudio troll"];
 
 const VALORANT_ROLES = [
   {
@@ -237,6 +237,51 @@ async function applyValorantRole(member, ptRoleName, origin, actorTag, fullRankL
   return prevLabel;
 }
 
+function buildManualRoleRow() {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('manual_valorant_role')
+    .setPlaceholder('Escolha seu elo do VALORANT manualmente')
+    .addOptions(VALORANT_ROLES.map((r) => ({ label: r.name, value: r.name })));
+  return new ActionRowBuilder().addComponents(select);
+}
+
+const SLASH_COMMANDS_JSON = [
+  new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('Toca uma música ou adiciona à fila da call')
+    .addStringOption((opt) => opt.setName('busca').setDescription('Nome ou link').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('modskip')
+    .setDescription('Pula imediatamente uma faixa inadequada e grava na auditoria')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addStringOption((opt) => opt.setName('motivo').setDescription('Motivo da remoção').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('criar-cargos-valorant')
+    .setDescription('Cria e ordena os 9 cargos de elos do VALORANT no servidor')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles),
+  new SlashCommandBuilder()
+    .setName('vincular')
+    .setDescription('Vincula sua conta Riot para atualizar seu cargo de elo automaticamente')
+    .addStringOption((opt) => opt.setName('riotid').setDescription('Formato Nome#TAG').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('cargo-manual')
+    .setDescription('Abre o seletor manual de cargo de elo do VALORANT'),
+].map((c) => c.toJSON());
+
+async function syncSlashCommandsForGuild(guildId, guildName = guildId) {
+  const appId = process.env.DISCORD_CLIENT_ID || client.user?.id;
+  if (!appId || !process.env.DISCORD_BOT_TOKEN) return;
+  try {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
+    await rest.put(Routes.applicationGuildCommands(appId, guildId), {
+      body: SLASH_COMMANDS_JSON,
+    });
+    console.log(`[${BOT_NAME}] Comandos / sincronizados no servidor: ${guildName}`);
+  } catch (err) {
+    console.error(`Aviso ao sincronizar comandos em ${guildName}:`, err);
+  }
+}
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
   if (!message.content.startsWith(PREFIX)) return;
@@ -320,14 +365,9 @@ client.on('messageCreate', async (message) => {
     }
     const rankData = await fetchValorantRank('br', riotName, riotTag);
     if (!rankData) {
-      const select = new StringSelectMenuBuilder()
-        .setCustomId('manual_valorant_role')
-        .setPlaceholder('Não foi possível ler a API Riot — escolha seu elo manualmente')
-        .addOptions(VALORANT_ROLES.map((r) => ({ label: r.name, value: r.name })));
-
       return message.reply({
         content: 'Conta privada ou API indisponível no momento. Selecione seu cargo manualmente abaixo:',
-        components: [new ActionRowBuilder().addComponents(select)],
+        components: [buildManualRoleRow()],
       });
     }
 
@@ -338,7 +378,8 @@ client.on('messageCreate', async (message) => {
       client.user.tag,
       rankData.fullRankLabel
     );
-    linkedAccounts.set(message.author.id, {
+    linkedAccounts.set(`${message.guild.id}:${message.author.id}`, {
+      userId: message.author.id,
       guildId: message.guild.id,
       riotName,
       riotTag,
@@ -353,8 +394,7 @@ client.on('messageCreate', async (message) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isStringSelectMenu()) return;
-  if (interaction.customId === 'manual_valorant_role') {
+  if (interaction.isStringSelectMenu() && interaction.customId === 'manual_valorant_role') {
     const chosenRole = interaction.values[0];
     await applyValorantRole(
       interaction.member,
@@ -366,17 +406,114 @@ client.on('interactionCreate', async (interaction) => {
       content: `Cargo **${chosenRole}** atribuído manualmente e registrado na auditoria!`,
       ephemeral: true,
     });
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === 'criar-cargos-valorant') {
+    await interaction.deferReply({ ephemeral: true });
+    const created = await ensureValorantRoles(interaction.guild, interaction.user.tag);
+    await interaction.editReply(
+      created.length
+        ? `Cargos criados com sucesso: ${created.join(', ')}`
+        : 'Todos os 9 cargos do VALORANT já estão criados neste servidor!'
+    );
+  }
+
+  if (interaction.commandName === 'cargo-manual') {
+    await interaction.reply({
+      content: 'Selecione abaixo o seu elo atual do VALORANT:',
+      components: [buildManualRoleRow()],
+      ephemeral: true,
+    });
+  }
+
+  if (interaction.commandName === 'vincular') {
+    await interaction.deferReply();
+    const rawRiotId = interaction.options.getString('riotid', true);
+    const [riotName, riotTag] = rawRiotId.split('#');
+    if (!riotName || !riotTag) {
+      return interaction.editReply('Formato inválido! Use `Nome#TAG` (ex: `Jogador#BR1`).');
+    }
+    const rankData = await fetchValorantRank('br', riotName, riotTag);
+    if (!rankData) {
+      return interaction.editReply({
+        content: 'Não foi possível ler seu MMR automaticamente. Escolha o cargo manualmente abaixo:',
+        components: [buildManualRoleRow()],
+      });
+    }
+    await applyValorantRole(
+      interaction.member,
+      rankData.ptRoleName,
+      'Vínculo Automático Riot (/vincular)',
+      client.user.tag,
+      rankData.fullRankLabel
+    );
+    linkedAccounts.set(`${interaction.guild.id}:${interaction.user.id}`, {
+      userId: interaction.user.id,
+      guildId: interaction.guild.id,
+      riotName,
+      riotTag,
+      region: 'br',
+      lastTierOrder: rankData.tierOrder,
+      lastRankName: rankData.fullRankLabel,
+    });
+    await interaction.editReply(
+      `Conta **${riotName}#${riotTag}** vinculada! Novo cargo: **${rankData.fullRankLabel}** (${rankData.rr} RR).`
+    );
+  }
+
+  if (interaction.commandName === 'play') {
+    const voiceChannel = interaction.member?.voice?.channel;
+    if (!voiceChannel) {
+      return interaction.reply({ content: 'Entre em uma call de voz no Discord primeiro!', ephemeral: true });
+    }
+    const search = interaction.options.getString('busca', true);
+    if (BLOCKED_TERMS.some((term) => search.toLowerCase().includes(term.toLowerCase()))) {
+      return interaction.reply({
+        content: 'Essa música contém palavras bloqueadas nas regras da call.',
+        ephemeral: true,
+      });
+    }
+    await interaction.reply(`Buscando e tocando **${search}** na call **${voiceChannel.name}**...`);
+    await distube.play(voiceChannel, search, {
+      member: interaction.member,
+      textChannel: interaction.channel,
+    });
+  }
+
+  if (interaction.commandName === 'modskip') {
+    const queue = distube.getQueue(interaction.guildId);
+    if (!queue || !queue.songs[0]) {
+      return interaction.reply({ content: 'Nenhuma faixa tocando no momento.', ephemeral: true });
+    }
+    const removed = queue.songs[0];
+    const reason = interaction.options.getString('motivo', true);
+    if (queue.songs.length > 1) await queue.skip();
+    else await queue.stop();
+
+    await sendAuditLog(interaction.guild, {
+      category: 'MOD_SKIP',
+      action: 'Mod Skip (/modskip)',
+      actorTag: interaction.user.tag,
+      target: `${removed.name}`,
+      reason,
+      before: removed.name,
+      after: queue.songs[1]?.name || 'Fila encerrada',
+    });
+    await interaction.reply(`Faixa **${removed.name}** removida pela moderação (${reason}).`);
   }
 });
 
 setInterval(async () => {
-  for (const [userId, account] of linkedAccounts.entries()) {
+  for (const account of linkedAccounts.values()) {
     const rankData = await fetchValorantRank(account.region, account.riotName, account.riotTag);
     if (!rankData || rankData.tierOrder <= account.lastTierOrder) continue;
 
     const guild = client.guilds.cache.get(account.guildId);
     if (!guild) continue;
-    const member = await guild.members.fetch(userId).catch(() => null);
+    const member = await guild.members.fetch(account.userId).catch(() => null);
     if (!member) continue;
 
     const oldRank = account.lastRankName;
@@ -396,50 +533,23 @@ setInterval(async () => {
     );
     if (rankUpChannel) {
       await rankUpChannel.send(
-        `Parabéns <@${userId}> (**${account.riotName}#${account.riotTag}**)! Subiu de **${oldRank}** para **${rankData.fullRankLabel}** (${rankData.rr} RR)!`
+        `Parabéns <@${account.userId}> (**${account.riotName}#${account.riotTag}**)! Subiu de **${oldRank}** para **${rankData.fullRankLabel}** (${rankData.rr} RR)!`
       );
     }
   }
 }, 15 * 60 * 1000);
 
-// Registro automático dos Slash Commands ao iniciar no Render (dispensa acesso pago ao Shell)
+// Sincroniza Slash Commands em TODOS os servidores atuais e em qualquer servidor novo onde o bot entrar
 client.once('ready', async () => {
-  console.log(`[${BOT_NAME}] Conectado no Discord como ${client.user.tag}`);
-  if (process.env.DISCORD_CLIENT_ID && process.env.DISCORD_GUILD_ID) {
-    try {
-      const slashCommands = [
-        new SlashCommandBuilder()
-          .setName('play')
-          .setDescription('Toca uma música ou adiciona à fila da call')
-          .addStringOption((opt) => opt.setName('busca').setDescription('Nome ou link').setRequired(true)),
-        new SlashCommandBuilder()
-          .setName('modskip')
-          .setDescription('Pula imediatamente uma faixa inadequada e grava na auditoria')
-          .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-          .addStringOption((opt) => opt.setName('motivo').setDescription('Motivo da remoção').setRequired(true)),
-        new SlashCommandBuilder()
-          .setName('criar-cargos-valorant')
-          .setDescription('Cria e ordena os 9 cargos de elos do VALORANT no servidor')
-          .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles),
-        new SlashCommandBuilder()
-          .setName('vincular')
-          .setDescription('Vincula sua conta Riot para atualizar seu cargo de elo automaticamente')
-          .addStringOption((opt) => opt.setName('riotid').setDescription('Formato Nome#TAG').setRequired(true)),
-        new SlashCommandBuilder()
-          .setName('cargo-manual')
-          .setDescription('Abre o seletor manual de cargo de elo do VALORANT'),
-      ].map((c) => c.toJSON());
-
-      const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
-      await rest.put(
-        Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
-        { body: slashCommands }
-      );
-      console.log(`[${BOT_NAME}] Slash commands sincronizados automaticamente!`);
-    } catch (err) {
-      console.error('Aviso ao sincronizar slash commands:', err);
-    }
+  console.log(`[${BOT_NAME}] Conectado no Discord como ${client.user.tag} em ${client.guilds.cache.size} servidor(es)`);
+  for (const guild of client.guilds.cache.values()) {
+    await syncSlashCommandsForGuild(guild.id, guild.name);
   }
+});
+
+client.on('guildCreate', async (guild) => {
+  console.log(`[${BOT_NAME}] Entrou em um novo servidor: ${guild.name} (${guild.id})`);
+  await syncSlashCommandsForGuild(guild.id, guild.name);
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN);
