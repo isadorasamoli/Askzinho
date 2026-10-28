@@ -1,0 +1,21 @@
+# Blueprint oficial para hospedar o Askzinho gratuitamente no Render.com
+# Combine com um monitor HTTP(s) de 5 em 5 minutos no UptimeRobot apontando para /health
+services:
+  - type: web
+    name: askzinho
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: HENRIK_API_KEY
+        sync: false
