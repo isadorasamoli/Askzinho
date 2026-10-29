@@ -49,6 +49,7 @@ const PREFIX = "!";
 const REQUEST_CHANNEL_NAME = "🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞";
 const RANKUP_CHANNEL_NAME = "upou-de-elo";
 const MODLOG_CHANNEL_NAME = "auditoria-mod";
+const DEFAULT_VOLUME = 40;
 const BLOCKED_TERMS = ["estourado","gemidao","999db","proibidão","áudio troll"];
 
 const VALORANT_ROLES = [
@@ -264,7 +265,7 @@ async function* downloadAudioStream(streamUrl, signal) {
   }
 }
 
-async function createCloudSafeAudioResource(song, volumePercent = 80) {
+async function createCloudSafeAudioResource(song, volumePercent = DEFAULT_VOLUME) {
   const streamUrl =
     (await soundcloud.util.streamLink(song.trackObj || song.url, 'mpeg').catch(() => null)) ||
     (await soundcloud.util.streamLink(song.trackObj || song.url));
@@ -291,7 +292,7 @@ async function createCloudSafeAudioResource(song, volumePercent = 80) {
     inputType: StreamType.Raw,
     inlineVolume: true,
   });
-  resource.volume?.setVolume(Math.max(0, Math.min(2, volumePercent / 100)));
+  resource.volume?.setVolumeLogarithmic(Math.max(0, Math.min(1.5, volumePercent / 100)));
 
   const cleanup = () => {
     abortController.abort();
@@ -390,7 +391,7 @@ async function enqueueAndPlay({ voiceChannel, textChannel, query, requestedByTag
       connection,
       player,
       songs: [],
-      volume: 80,
+      volume: DEFAULT_VOLUME,
       currentResource: null,
       currentCleanup: null,
     };
@@ -587,6 +588,12 @@ const SLASH_COMMANDS_JSON = [
     .setName('stop')
     .setDescription('Para a música, limpa a fila e desconecta da call'),
   new SlashCommandBuilder()
+    .setName('volume')
+    .setDescription('Ajusta o volume da música na call (0 a 150%)')
+    .addIntegerOption((opt) =>
+      opt.setName('nivel').setDescription('Volume desejado em % (padrão suave: 40)').setMinValue(0).setMaxValue(150).setRequired(true)
+    ),
+  new SlashCommandBuilder()
     .setName('modskip')
     .setDescription('Pula imediatamente uma faixa inadequada e grava na auditoria')
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
@@ -717,7 +724,7 @@ client.on('messageCreate', async (message) => {
       return message.reply(`Uso: \`${PREFIX}volume 0-150\` (atual: ${q.volume}%)`);
     }
     q.volume = Math.round(vol);
-    q.currentResource?.volume?.setVolume(q.volume / 100);
+    q.currentResource?.volume?.setVolumeLogarithmic(q.volume / 100);
     return message.reply(`Volume da call ajustado para **${q.volume}%**!`);
   }
 
@@ -908,6 +915,17 @@ client.on('interactionCreate', async (interaction) => {
     }
     destroyGuildQueue(interaction.guildId);
     await interaction.reply('Reprodução encerrada e desconectado da call!');
+  }
+
+  if (interaction.commandName === 'volume') {
+    const q = guildQueues.get(interaction.guildId);
+    if (!q) {
+      return interaction.reply({ content: 'Nenhuma música ativa na call agora.', ephemeral: true });
+    }
+    const vol = interaction.options.getInteger('nivel', true);
+    q.volume = vol;
+    q.currentResource?.volume?.setVolumeLogarithmic(q.volume / 100);
+    await interaction.reply(`Volume da call ajustado para **${q.volume}%**!`);
   }
 
   if (interaction.commandName === 'modskip') {
