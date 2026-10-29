@@ -35,22 +35,8 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName('painel-tickets')
-    .setDescription('Publica o painel fixo de tickets privados (Sugestão, Dúvida e Denúncia)')
+    .setDescription('Publica o painel fixo de tickets privados no canal configurado')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder()
-    .setName('ticket')
-    .setDescription('Abre um ticket privado com os Admins (Sugestão, Dúvida ou Denúncia)')
-    .addStringOption((opt) =>
-      opt
-        .setName('tipo')
-        .setDescription('Escolha o motivo do ticket privado')
-        .setRequired(true)
-        .addChoices(
-          { name: 'Enviar Sugestão', value: 'sugestao' },
-          { name: 'Tirar Dúvida', value: 'duvida' },
-          { name: 'Denunciar Membro (Confidencial)', value: 'denuncia' }
-        )
-    ),
   new SlashCommandBuilder()
     .setName('vincular')
     .setDescription('Vincula sua conta Riot em modo privado (visível só para você e Admins)')
