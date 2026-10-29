@@ -1,15 +1,20 @@
 /**
  * Askzinho — Bot Discord Oficial (QG do Gusta · TikTok & VLR)
  * Recursos integrados:
- * - Música estilo Rythm/Groovy com playlists personalizadas para calls
- * - Pedidos em tempo real em #🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞 + !modskip rápido para moderadores
+ * - Motor de Áudio Nativo (@discordjs/voice + DAVE E2EE + Node Stream -> FFmpeg stdin pipe:0)
+ *   100% imune ao crash SIGSEGV do ffmpeg-static em containers Linux (Render) e bloqueios de IP
+ * - Aceita nome da música, links do YouTube, Spotify e SoundCloud + playlists personalizadas
+ * - Pedidos em tempo real em #🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞 + !modskip / /modskip rápido para moderadores
  * - Criação automática dos 9 cargos de elos do VALORANT (Ferro a Radiante)
- * - Vínculo de conta Riot + Fallback de seleção manual via menu interativo
-   * - Servidor HTTP Keep-Alive embutido (0.0.0.0:PORT / rota /health) pronto para Render + UptimeRobot
+ * - Vínculo de conta Riot + Fallback de seleção manual via menu interativo em qualquer servidor
+ * - Servidor HTTP Keep-Alive embutido (0.0.0.0:PORT / rota /health) pronto para Render + UptimeRobot
  */
 
 import 'dotenv/config';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
+import { createRequire } from 'node:module';
 import {
   ActionRowBuilder,
   Client,
@@ -21,11 +26,25 @@ import {
   SlashCommandBuilder,
   StringSelectMenuBuilder,
 } from 'discord.js';
-import { DisTube } from 'distube';
-import { SoundCloudPlugin } from '@distube/soundcloud';
-import { SpotifyPlugin } from '@distube/spotify';
-import { YouTubePlugin } from '@distube/youtube';
+import {
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  StreamType,
+  VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  generateDependencyReport,
+  joinVoiceChannel,
+} from '@discordjs/voice';
 import ffmpegPath from 'ffmpeg-static';
+import sodium from 'libsodium-wrappers';
+
+await sodium.ready;
+
+const require = createRequire(import.meta.url);
+const { Soundcloud } = require('soundcloud.ts');
+const soundcloud = new Soundcloud();
 
 const BOT_NAME = "Askzinho";
 const PORT = Number(process.env.PORT) || 10000;
@@ -98,6 +117,7 @@ const CUSTOM_PLAYLISTS = {
 };
 
 const linkedAccounts = new Map();
+const guildQueues = new Map();
 
 const client = new Client({
   intents: [
@@ -119,6 +139,7 @@ const keepAliveServer = http.createServer((req, res) => {
         bot: BOT_NAME,
         discordReady: client.isReady(),
         pingMs: client.ws.ping,
+        activeCalls: guildQueues.size,
         uptimeSec: Math.floor(process.uptime()),
       })
     );
@@ -132,48 +153,317 @@ keepAliveServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[${BOT_NAME}] Keep-Alive HTTP ativo em 0.0.0.0:${PORT} (/health pronto para Render e UptimeRobot)`);
 });
 
-// DisTube configurado para nuvem (Render):
-// 1. Usa o binário do ffmpeg-static diretamente (o Render Free não traz ffmpeg global)
-// 2. Prioriza SoundCloud + Spotify nas buscas para evitar bloqueio de IP de datacenter do YouTube
-const distube = new DisTube(client, {
-  emitNewSongOnly: true,
-  ffmpeg: {
-    path: ffmpegPath,
-  },
-  plugins: [
-    new SoundCloudPlugin(),
-    new SpotifyPlugin(),
-    new YouTubePlugin(),
-  ],
-});
+// ============================================================================
+// MOTOR DE ÁUDIO CLOUD-SAFE (Node fetch -> FFmpeg pipe:0 -> Opus 48kHz Stereo)
+// ============================================================================
 
-distube.on('playSong', (queue, song) => {
-  queue.textChannel
-    ?.send(`Tocando agora na call: **${song.name}** (`${song.formattedDuration}`)`)
-    .catch(() => {});
-});
+function formatDurationMs(ms) {
+  const totalSec = Math.max(0, Math.round((ms || 0) / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
 
-distube.on('addSong', (queue, song) => {
-  if (queue.songs.length > 1) {
-    queue.textChannel
-      ?.send(`Adicionada na fila (#${queue.songs.length - 1}): **${song.name}** (`${song.formattedDuration}`)`)
-      .catch(() => {});
+async function resolveSongQuery(rawQuery, requestedByTag) {
+  let searchQuery = rawQuery.trim();
+
+  // Converte links do YouTube em busca por título+canal via oEmbed oficial (não sofre bloqueio de IP)
+  if (/^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/watch|youtu\.be\/)/i.test(searchQuery)) {
+    try {
+      const oembedRes = await fetch(
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(searchQuery)}&format=json`
+      );
+      if (oembedRes.ok) {
+        const meta = await oembedRes.json();
+        searchQuery = `${meta.title} ${meta.author_name || ''}`.trim();
+      }
+    } catch {}
   }
-});
 
-distube.on('error', (arg1, arg2) => {
-  const err = arg1 instanceof Error ? arg1 : arg2;
-  const ctx = arg1 instanceof Error ? arg2 : arg1;
-  const channel = ctx?.textChannel || (typeof ctx?.send === 'function' ? ctx : null);
-  console.error(`[${BOT_NAME}] Erro no DisTube:`, err);
-  if (channel) {
-    channel
+  // Converte links do Spotify em busca por título via oEmbed oficial
+  if (/^https?:\/\/open\.spotify\.com\/track\//i.test(searchQuery)) {
+    try {
+      const spRes = await fetch(
+        `https://open.spotify.com/oembed?url=${encodeURIComponent(searchQuery)}`
+      );
+      if (spRes.ok) {
+        const meta = await spRes.json();
+        if (meta.title) searchQuery = meta.title;
+      }
+    } catch {}
+  }
+
+  // Link direto do SoundCloud
+  if (/^https?:\/\/(?:www\.|m\.)?soundcloud\.com\//i.test(searchQuery)) {
+    const cleanUrl = searchQuery.replace(/:\/\/(m|www)\./i, '://');
+    const track = await soundcloud.tracks.get(cleanUrl);
+    if (!track) throw new Error('Faixa do SoundCloud não encontrada.');
+    return {
+      title: track.title,
+      url: track.permalink_url,
+      durationFormatted: formatDurationMs(track.duration),
+      requestedByTag,
+      trackObj: track,
+    };
+  }
+
+  // Busca por nome da música / artista
+  const results = await soundcloud.tracks.search({ q: searchQuery, limit: 8 });
+  const list = results?.collection || [];
+  if (!list.length) {
+    throw new Error(`Nenhum resultado encontrado para "${searchQuery}".`);
+  }
+
+  const chosen =
+    list.find(
+      (t) =>
+        t.media?.transcodings?.length > 0 &&
+        !t.media.transcodings.some((tr) => tr.snipped) &&
+        t.duration > 35000
+    ) ||
+    list.find((t) => t.media?.transcodings?.length > 0) ||
+    list[0];
+
+  return {
+    title: chosen.title,
+    url: chosen.permalink_url,
+    durationFormatted: formatDurationMs(chosen.duration),
+    requestedByTag,
+    trackObj: chosen,
+  };
+}
+
+async function* downloadAudioStream(streamUrl, signal) {
+  const res = await fetch(streamUrl, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ao baixar stream de áudio`);
+  const contentType = res.headers.get('content-type') || '';
+
+  if (!streamUrl.includes('.m3u8') && !contentType.includes('mpegurl')) {
+    for await (const chunk of res.body) {
+      if (signal.aborted) return;
+      yield Buffer.from(chunk);
+    }
+    return;
+  }
+
+  const m3u8Text = await res.text();
+  const lines = m3u8Text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (signal.aborted) return;
+    if (line.startsWith('#EXT-X-MAP:URI=')) {
+      const mapUrl = line.match(/URI="([^"]+)"/)?.[1];
+      if (mapUrl) {
+        const mapRes = await fetch(mapUrl, { signal });
+        if (mapRes.ok) yield Buffer.from(await mapRes.arrayBuffer());
+      }
+    } else if (!line.startsWith('#')) {
+      const segRes = await fetch(line, { signal });
+      if (segRes.ok) yield Buffer.from(await segRes.arrayBuffer());
+    }
+  }
+}
+
+async function createCloudSafeAudioResource(song, volumePercent = 80) {
+  const streamUrl =
+    (await soundcloud.util.streamLink(song.trackObj || song.url, 'mpeg').catch(() => null)) ||
+    (await soundcloud.util.streamLink(song.trackObj || song.url));
+
+  if (!streamUrl) {
+    throw new Error('Não foi possível obter o stream de áudio da faixa.');
+  }
+
+  const abortController = new AbortController();
+  const nodeReadable = Readable.from(downloadAudioStream(streamUrl, abortController.signal));
+
+  // CRÍTICO: -i pipe:0 lê os bytes do Node via stdin (evita o crash SIGSEGV do ffmpeg-static em HTTPS no Render)
+  const ffmpegProc = spawn(
+    ffmpegPath,
+    ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+    { stdio: ['pipe', 'pipe', 'pipe'] }
+  );
+
+  nodeReadable.on('error', () => {});
+  ffmpegProc.stdin.on('error', () => {});
+  nodeReadable.pipe(ffmpegProc.stdin);
+
+  const resource = createAudioResource(ffmpegProc.stdout, {
+    inputType: StreamType.Raw,
+    inlineVolume: true,
+  });
+  resource.volume?.setVolume(Math.max(0, Math.min(2, volumePercent / 100)));
+
+  const cleanup = () => {
+    abortController.abort();
+    nodeReadable.destroy();
+    if (!ffmpegProc.killed) {
+      try {
+        ffmpegProc.kill('SIGKILL');
+      } catch {}
+    }
+  };
+
+  return { resource, cleanup };
+}
+
+function destroyGuildQueue(guildId) {
+  const q = guildQueues.get(guildId);
+  if (!q) return;
+  q.currentCleanup?.();
+  q.currentCleanup = null;
+  q.songs = [];
+  try {
+    q.player.stop(true);
+  } catch {}
+  try {
+    q.connection.destroy();
+  } catch {}
+  guildQueues.delete(guildId);
+}
+
+async function playNextInQueue(guildId) {
+  const q = guildQueues.get(guildId);
+  if (!q) return;
+
+  q.currentCleanup?.();
+  q.currentCleanup = null;
+  q.currentResource = null;
+
+  const nextSong = q.songs[0];
+  if (!nextSong) return;
+
+  try {
+    const { resource, cleanup } = await createCloudSafeAudioResource(nextSong, q.volume);
+    q.currentCleanup = cleanup;
+    q.currentResource = resource;
+    q.player.play(resource);
+
+    q.textChannel
+      ?.send(
+        `Tocando agora na call **${q.voiceChannelName}**: **${nextSong.title}** (\`${nextSong.durationFormatted}\`) — pedido por ${nextSong.requestedByTag}`
+      )
+      .catch(() => {});
+  } catch (err) {
+    console.error(`[${BOT_NAME}] Erro ao iniciar faixa "${nextSong.title}":`, err);
+    q.textChannel
+      ?.send(`Erro ao reproduzir **${nextSong.title}** (\`${err.message}\`). Pulando para a próxima...`)
+      .catch(() => {});
+    q.songs.shift();
+    if (q.songs.length > 0) {
+      await playNextInQueue(guildId);
+    }
+  }
+}
+
+async function enqueueAndPlay({ voiceChannel, textChannel, query, requestedByTag, silentQueueNotice = false }) {
+  const song = await resolveSongQuery(query, requestedByTag);
+  const guildId = voiceChannel.guild.id;
+  let q = guildQueues.get(guildId);
+
+  if (!q) {
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+    if (voiceChannel.type === 13) {
+      await voiceChannel.guild.members.me?.voice?.setSuppressed(false).catch(() => {});
+    }
+
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+    });
+
+    connection.subscribe(player);
+
+    q = {
+      guildId,
+      voiceChannelName: voiceChannel.name,
+      textChannel,
+      connection,
+      player,
+      songs: [],
+      volume: 80,
+      currentResource: null,
+      currentCleanup: null,
+    };
+
+    guildQueues.set(guildId, q);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      const activeQ = guildQueues.get(guildId);
+      if (!activeQ) return;
+      activeQ.songs.shift();
+      if (activeQ.songs.length > 0) {
+        playNextInQueue(guildId);
+      }
+    });
+
+    player.on('error', (err) => {
+      console.error(`[${BOT_NAME}] Erro no AudioPlayer:`, err);
+      const activeQ = guildQueues.get(guildId);
+      if (!activeQ) return;
+      activeQ.songs.shift();
+      if (activeQ.songs.length > 0) {
+        playNextInQueue(guildId);
+      }
+    });
+
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        ]);
+      } catch {
+        destroyGuildQueue(guildId);
+      }
+    });
+  } else {
+    q.textChannel = textChannel;
+    q.voiceChannelName = voiceChannel.name;
+    if (q.connection.joinConfig.channelId !== voiceChannel.id) {
+      q.connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId,
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: true,
+        selfMute: false,
+      });
+      await entersState(q.connection, VoiceConnectionStatus.Ready, 20_000);
+      q.connection.subscribe(q.player);
+    }
+  }
+
+  const wasEmpty = q.songs.length === 0;
+  q.songs.push(song);
+
+  if (wasEmpty) {
+    await playNextInQueue(guildId);
+  } else if (!silentQueueNotice) {
+    await textChannel
       .send(
-        `Não consegui tocar essa faixa (`${err?.message || 'erro de stream'}`). Dica: busque pelo **nome da música** ou link do Spotify/SoundCloud!`
+        `Adicionada na fila (#${q.songs.length - 1}): **${song.title}** (\`${song.durationFormatted}\`) — pedido por ${requestedByTag}`
       )
       .catch(() => {});
   }
-});
+
+  return song;
+}
+
+// ============================================================================
+// AUDITORIA E CARGOS DE ELOS DO VALORANT
+// ============================================================================
 
 async function sendAuditLog(guild, { category, action, actorTag, target, reason, before, after }) {
   const logChannel = guild.channels.cache.find((c) => c.name === MODLOG_CHANNEL_NAME && c.isTextBased());
@@ -290,7 +580,15 @@ const SLASH_COMMANDS_JSON = [
   new SlashCommandBuilder()
     .setName('play')
     .setDescription('Toca uma música ou adiciona à fila da call')
-    .addStringOption((opt) => opt.setName('busca').setDescription('Nome ou link').setRequired(true)),
+    .addStringOption((opt) =>
+      opt.setName('busca').setDescription('Nome da música ou link (YouTube/Spotify/SoundCloud)').setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('skip')
+    .setDescription('Pula para a próxima música da fila da call'),
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Para a música, limpa a fila e desconecta da call'),
   new SlashCommandBuilder()
     .setName('modskip')
     .setDescription('Pula imediatamente uma faixa inadequada e grava na auditoria')
@@ -331,9 +629,11 @@ client.on('messageCreate', async (message) => {
   const cmd = cmdRaw.toLowerCase();
   const query = args.join(' ');
 
-  if (cmd === 'play' || cmd === 'p') {
+  if (cmd === 'play' || cmd === 'p' || cmd === 'tocar') {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('Entre em uma call de voz no Discord para pedir música!');
+    if (!query) return message.reply(`Uso: \`${PREFIX}play nome da música ou link\``);
+
     if (BLOCKED_TERMS.some((term) => query.toLowerCase().includes(term.toLowerCase()))) {
       await sendAuditLog(message.guild, {
         category: 'MOD_SKIP',
@@ -344,23 +644,23 @@ client.on('messageCreate', async (message) => {
       });
       return message.reply('Essa música contém palavras bloqueadas nas regras da call.');
     }
+
     try {
-      await distube.play(voiceChannel, query, {
-        member: message.member,
+      await enqueueAndPlay({
+        voiceChannel,
         textChannel: message.channel,
-        message,
+        query,
+        requestedByTag: message.author.toString(),
       });
     } catch (err) {
       console.error(`[${BOT_NAME}] Falha no !play:`, err);
-      return message.reply(
-        'Não foi possível carregar esse link direto (o YouTube costuma bloquear servidores na nuvem). Tente digitar **!play nome da música e artista**!'
-      );
+      return message.reply(`Não consegui reproduzir **${query}** (\`${err.message}\`).`);
     }
   }
 
-  if (cmd === 'playlist') {
+  if (cmd === 'playlist' || cmd === 'pl') {
     const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply('Entre em um canal de voz primeiro.');
+    if (!voiceChannel) return message.reply('Entre em uma call de voz primeiro!');
     const foundKey = Object.keys(CUSTOM_PLAYLISTS).find((k) =>
       k.toLowerCase().includes(query.toLowerCase())
     );
@@ -369,46 +669,95 @@ client.on('messageCreate', async (message) => {
     }
     try {
       for (const trackQuery of CUSTOM_PLAYLISTS[foundKey]) {
-        await distube.play(voiceChannel, trackQuery, {
-          member: message.member,
+        await enqueueAndPlay({
+          voiceChannel,
           textChannel: message.channel,
+          query: trackQuery,
+          requestedByTag: message.author.toString(),
+          silentQueueNotice: true,
         });
       }
-      return message.reply(`Playlist **${foundKey}** adicionada à call!`);
+      return message.reply(`Playlist **${foundKey}** adicionada na call **${voiceChannel.name}**!`);
     } catch (err) {
       console.error(`[${BOT_NAME}] Falha na playlist:`, err);
       return message.reply('Erro ao carregar uma das faixas da playlist na call.');
     }
   }
 
-  if (cmd === 'skip' || cmd === 's') {
-    const queue = distube.getQueue(message);
-    if (!queue) return message.reply('Nenhuma música na fila.');
-    await queue.skip();
-    return message.reply('Faixa pulada!');
+  if (cmd === 'skip' || cmd === 's' || cmd === 'pular') {
+    const q = guildQueues.get(message.guild.id);
+    if (!q || !q.songs.length) return message.reply('Nenhuma música tocando na call agora.');
+    const skipped = q.songs[0];
+    q.player.stop();
+    return message.reply(`Faixa **${skipped.title}** pulada!`);
   }
 
-  if (cmd === 'modskip' || cmd === 'forceskip') {
+  if (cmd === 'pause' || cmd === 'pausar') {
+    const q = guildQueues.get(message.guild.id);
+    if (!q) return message.reply('Nenhuma música ativa na call.');
+    q.player.pause();
+    return message.reply('Áudio pausado na call.');
+  }
+
+  if (cmd === 'resume' || cmd === 'continuar') {
+    const q = guildQueues.get(message.guild.id);
+    if (!q) return message.reply('Nenhuma música pausada na call.');
+    q.player.unpause();
+    return message.reply('Áudio retomado na call!');
+  }
+
+  if (cmd === 'stop' || cmd === 'parar' || cmd === 'clear') {
+    if (!guildQueues.has(message.guild.id)) return message.reply('O bot não está tocando nada agora.');
+    destroyGuildQueue(message.guild.id);
+    return message.reply('Reprodução encerrada e fila limpa!');
+  }
+
+  if (cmd === 'volume' || cmd === 'vol') {
+    const q = guildQueues.get(message.guild.id);
+    if (!q) return message.reply('Nenhuma música tocando no momento.');
+    const vol = Number(query);
+    if (!Number.isFinite(vol) || vol < 0 || vol > 150) {
+      return message.reply(`Uso: \`${PREFIX}volume 0-150\` (atual: ${q.volume}%)`);
+    }
+    q.volume = Math.round(vol);
+    q.currentResource?.volume?.setVolume(q.volume / 100);
+    return message.reply(`Volume da call ajustado para **${q.volume}%**!`);
+  }
+
+  if (cmd === 'queue' || cmd === 'fila' || cmd === 'q') {
+    const q = guildQueues.get(message.guild.id);
+    if (!q || !q.songs.length) return message.reply('A fila da call está vazia.');
+    const lines = q.songs
+      .slice(0, 10)
+      .map((s, idx) =>
+        idx === 0
+          ? `>**Tocando agora:** ${s.title} (\`${s.durationFormatted}\`)`
+          : `\`${idx}.\` ${s.title} (\`${s.durationFormatted}\`)`
+      );
+    return message.reply(lines.join('\n'));
+  }
+
+  if (cmd === 'modskip' || cmd === 'forceskip' || cmd === 'vetar') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
       return message.reply('Apenas moderadores podem usar o Mod Skip.');
     }
-    const queue = distube.getQueue(message);
-    if (!queue || !queue.songs[0]) return message.reply('Nenhuma faixa ativa.');
-    const removed = queue.songs[0];
+    const q = guildQueues.get(message.guild.id);
+    if (!q || !q.songs[0]) return message.reply('Nenhuma faixa ativa na call.');
+    const removed = q.songs[0];
+    const nextTitle = q.songs[1]?.title || 'Fila encerrada';
     const reason = query || 'Faixa inadequada para a call';
-    if (queue.songs.length > 1) await queue.skip();
-    else await queue.stop();
+    q.player.stop();
 
     await sendAuditLog(message.guild, {
       category: 'MOD_SKIP',
       action: 'Mod Skip — Remoção Rápida',
       actorTag: message.author.tag,
-      target: `${removed.name} (pedido por ${removed.user?.tag || 'desconhecido'})`,
+      target: `${removed.title} (pedido por ${removed.requestedByTag})`,
       reason,
-      before: removed.name,
-      after: queue.songs[1]?.name || 'Fila encerrada',
+      before: removed.title,
+      after: nextTitle,
     });
-    return message.channel.send(`Faixa **${removed.name}** removida pela moderação (${reason}).`);
+    return message.channel.send(`Faixa **${removed.title}** removida pela moderação (${reason}).`);
   }
 
   if (cmd === 'vincular') {
@@ -531,39 +880,59 @@ client.on('interactionCreate', async (interaction) => {
     }
     await interaction.deferReply();
     try {
-      await distube.play(voiceChannel, search, {
-        member: interaction.member,
+      const song = await enqueueAndPlay({
+        voiceChannel,
         textChannel: interaction.channel,
+        query: search,
+        requestedByTag: interaction.user.toString(),
       });
-      await interaction.editReply(` Pedido enviado para a call **${voiceChannel.name}**: **${search}**`);
+      await interaction.editReply(
+        `Carregada para a call **${voiceChannel.name}**: **${song.title}** (\`${song.durationFormatted}\`)`
+      );
     } catch (err) {
       console.error(`[${BOT_NAME}] Falha no /play:`, err);
-      await interaction.editReply(
-        'Não consegui abrir esse link (o YouTube costuma bloquear IPs do Render). Tente mandar apenas o **nome da música e artista**!'
-      );
+      await interaction.editReply(`Não consegui tocar **${search}** (\`${err.message}\`).`);
     }
   }
 
+  if (interaction.commandName === 'skip') {
+    const q = guildQueues.get(interaction.guildId);
+    if (!q || !q.songs.length) {
+      return interaction.reply({ content: 'Nenhuma música tocando agora.', ephemeral: true });
+    }
+    const skipped = q.songs[0];
+    q.player.stop();
+    await interaction.reply(`Faixa **${skipped.title}** pulada!`);
+  }
+
+  if (interaction.commandName === 'stop') {
+    if (!guildQueues.has(interaction.guildId)) {
+      return interaction.reply({ content: 'Nenhuma música ativa na call.', ephemeral: true });
+    }
+    destroyGuildQueue(interaction.guildId);
+    await interaction.reply('Reprodução encerrada e desconectado da call!');
+  }
+
   if (interaction.commandName === 'modskip') {
-    const queue = distube.getQueue(interaction.guildId);
-    if (!queue || !queue.songs[0]) {
+    const q = guildQueues.get(interaction.guildId);
+    if (!q || !q.songs[0]) {
       return interaction.reply({ content: 'Nenhuma faixa tocando no momento.', ephemeral: true });
     }
-    const removed = queue.songs[0];
+    const removed = q.songs[0];
+    const nextTitle = q.songs[1]?.title || 'Fila encerrada';
     const reason = interaction.options.getString('motivo', true);
-    if (queue.songs.length > 1) await queue.skip();
-    else await queue.stop();
+    q.player.stop();
 
     await sendAuditLog(interaction.guild, {
       category: 'MOD_SKIP',
       action: 'Mod Skip (/modskip)',
       actorTag: interaction.user.tag,
-      target: `${removed.name}`,
+      target: `${removed.title}`,
       reason,
-      before: removed.name,
-      after: queue.songs[1]?.name || 'Fila encerrada',
+      before: removed.title,
+      after: nextTitle,
     });
-    await interaction.reply(`Faixa **${removed.name}** removida pela moderação (${reason}).`);
+    await interaction.reply(`Faixa **${removed.title}** removida pela moderação (${reason}).`);
   }
 });
 
@@ -603,6 +972,7 @@ setInterval(async () => {
 // Sincroniza Slash Commands em TODOS os servidores atuais e em qualquer servidor novo onde o bot entrar
 client.once('ready', async () => {
   console.log(`[${BOT_NAME}] Conectado no Discord como ${client.user.tag} em ${client.guilds.cache.size} servidor(es)`);
+  console.log(generateDependencyReport());
   for (const guild of client.guilds.cache.values()) {
     await syncSlashCommandsForGuild(guild.id, guild.name);
   }
