@@ -38,6 +38,28 @@ const commands = [
     .setDescription('Publica o painel fixo de tickets privados no canal configurado')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
+    .setName('testar-boas-vindas')
+    .setDescription('Envia uma mensagem de teste de boas-vindas no canal de boas-vindas configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('aviso-geral')
+    .setDescription('Publica o comunicado oficial com @everyone no canal de avisos configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('status-live')
+    .setDescription('Verifica agora se a live configurada no TikTok está aberta')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('testar-live')
+    .setDescription('Envia um alerta de teste da live do TikTok no canal configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addBooleanOption((opt) =>
+      opt
+        .setName('mencionar_everyone')
+        .setDescription('Marcar @everyone neste envio? (padrão: Não)')
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName('vincular')
     .setDescription('Vincula sua conta Riot em modo privado (visível só para você e Admins)')
     .addStringOption((opt) => opt.setName('riotid').setDescription('Formato Nome#TAG').setRequired(true)),
