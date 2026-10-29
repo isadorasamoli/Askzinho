@@ -810,12 +810,8 @@ function isTicketPanelChannel(channel) {
   const normActual = normalizeChannelKey(channel.name);
   return (
     normActual === normTarget ||
-    normActual === 'tickets' ||
-    normActual === 'ticket' ||
     normActual.endsWith('•tickets') ||
-    normActual.endsWith('・tickets') ||
-    normActual.endsWith('•ticket') ||
-    normActual.endsWith('・ticket')
+    normActual.endsWith('・tickets')
   );
 }
 
@@ -828,15 +824,15 @@ function findTicketPanelChannel(guild) {
 function buildTicketPanelPayload() {
   const embed = new EmbedBuilder()
     .setColor(0xe11d48)
-    .setTitle('📩 Central de Atendimento Privado — Fale com os Admins')
+    .setTitle('🕷️ Central de Tickets Privados — Fale com os Admins')
     .setDescription(
-      'Precisa falar com a administração do servidor? Escolha uma categoria abaixo para abrir um **canal 100% privado** onde **somente você e os Admins** têm acesso:\n\n' +
+      'Precisa falar com a administração do servidor? Clique em um dos botões abaixo aqui neste canal para abrir uma **sala 100% privada** onde **somente você e os Admins** têm acesso:\n\n' +
         '💡 **Enviar Sugestão:** ideias de melhorias, eventos, playlists ou novidades para a comunidade.\n' +
         '❓ **Tirar Dúvida:** suporte sobre cargos, regras, calls ou funcionamento do servidor.\n' +
         '🚨 **Denunciar Membro:** relato sigiloso sobre ofensas, toxicidade, trollagem em call ou quebra de regras (você poderá anexar prints e clipes dentro do ticket privado).\n\n' +
-        '*Você também pode usar `/ticket` em qualquer canal do servidor.*'
+        '*Não digite sua mensagem ou denúncia no chat aberto: mensagens comuns enviadas aqui são apagadas automaticamente para proteger sua privacidade.*'
     )
-    .setFooter({ text: `${BOT_NAME} · Atendimento sigiloso entre você e a Administração` });
+    .setFooter({ text: `${BOT_NAME} · Atendimento sigiloso somente entre você e os Admins` });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -1098,22 +1094,8 @@ const SLASH_COMMANDS_JSON = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName('painel-tickets')
-    .setDescription('Publica o painel fixo de tickets privados (Sugestão, Dúvida e Denúncia)')
+    .setDescription('Publica o painel fixo de tickets privados no canal configurado')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-  new SlashCommandBuilder()
-    .setName('ticket')
-    .setDescription('Abre um ticket privado com os Admins (Sugestão, Dúvida ou Denúncia)')
-    .addStringOption((opt) =>
-      opt
-        .setName('tipo')
-        .setDescription('Escolha o motivo do ticket privado')
-        .setRequired(true)
-        .addChoices(
-          { name: 'Enviar Sugestão', value: 'sugestao' },
-          { name: 'Tirar Dúvida', value: 'duvida' },
-          { name: 'Denunciar Membro (Confidencial)', value: 'denuncia' }
-        )
-    ),
   new SlashCommandBuilder()
     .setName('vincular')
     .setDescription('Vincula sua conta Riot em modo privado (visível só para você e Admins)')
@@ -1171,14 +1153,16 @@ client.on('messageCreate', async (message) => {
         }
         return;
       }
-      const dedicated = findTicketPanelChannel(message.guild);
-      const targetCh = dedicated || message.channel;
-      if (targetCh.id === message.channel.id) {
+      if (isTicketPanelChannel(message.channel)) {
         await message.delete().catch(() => null);
       }
-      const postedIn = await ensureTicketPanelNotice(message.guild, true, targetCh);
-      if (postedIn && postedIn.id !== message.channel.id) {
-        await message.reply(`Painel de tickets privados publicado em <#${postedIn.id}>!`);
+      const postedIn = await ensureTicketPanelNotice(message.guild, true);
+      if (!isTicketPanelChannel(message.channel)) {
+        await message.reply(
+          postedIn
+            ? `Painel de tickets privados publicado no canal **${TICKET_PANEL_CHANNEL_NAME}**!`
+            : `Não encontrei o canal de texto **${TICKET_PANEL_CHANNEL_NAME}** neste servidor.`
+        );
       }
       return;
     }
@@ -1198,12 +1182,12 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Proteção automática no canal de painel de Tickets: evita que alguém exponha uma denúncia em público
+  // Proteção automática no canal de Tickets: evita que alguém exponha uma denúncia em público
   if (isTicketPanelChannel(message.channel)) {
     await message.delete().catch(() => null);
     const tempNotice = await message.channel
       .send(
-        `<@${message.author.id}>, use os botões do painel acima (ou \`/ticket\`) para abrir seu atendimento **privado** com os Admins!`
+        `<@${message.author.id}>, apaguei sua mensagem para manter seu atendimento **privado**! Clique nos botões do painel acima aqui em **${TICKET_PANEL_CHANNEL_NAME}** para falar somente com os Admins.`
       )
       .catch(() => null);
     if (tempNotice) {
@@ -1459,6 +1443,12 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId.startsWith('open_ticket_modal:')) {
+      if (!isTicketPanelChannel(interaction.channel)) {
+        return interaction.reply({
+          content: `Abra tickets exclusivamente pelos botões do canal **${TICKET_PANEL_CHANNEL_NAME}**.`,
+          ephemeral: true,
+        });
+      }
       const tipo = interaction.customId.split(':')[1];
       await interaction.showModal(buildTicketModal(tipo));
       return;
@@ -1748,19 +1738,12 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'painel-tickets') {
     await interaction.deferReply({ ephemeral: true });
-    const targetCh = findTicketPanelChannel(interaction.guild) || interaction.channel;
-    const posted = await ensureTicketPanelNotice(interaction.guild, true, targetCh);
+    const posted = await ensureTicketPanelNotice(interaction.guild, true);
     return interaction.editReply(
       posted
-        ? `Painel oficial de tickets privados publicado com sucesso em <#${posted.id}>!`
-        : 'Não foi possível publicar o painel de tickets neste canal.'
+        ? `Painel oficial de tickets privados publicado com sucesso em **${TICKET_PANEL_CHANNEL_NAME}** (<#${posted.id}>)!`
+        : `Não encontrei o canal **${TICKET_PANEL_CHANNEL_NAME}** neste servidor. Verifique o nome exato do canal de texto.`
     );
-  }
-
-  if (interaction.commandName === 'ticket') {
-    const tipo = interaction.options.getString('tipo', true);
-    await interaction.showModal(buildTicketModal(tipo));
-    return;
   }
 
   if (interaction.commandName === 'criar-cargos-valorant') {
