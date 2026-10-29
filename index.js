@@ -38,9 +38,6 @@ import {
   joinVoiceChannel,
 } from '@discordjs/voice';
 import ffmpegPath from 'ffmpeg-static';
-import sodium from 'libsodium-wrappers';
-
-await sodium.ready;
 
 const require = createRequire(import.meta.url);
 const { Soundcloud } = require('soundcloud.ts');
@@ -983,4 +980,8 @@ client.on('guildCreate', async (guild) => {
   await syncSlashCommandsForGuild(guild.id, guild.name);
 });
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+if (!process.env.DISCORD_BOT_TOKEN) {
+  console.error(`[${BOT_NAME}] ERRO: Variável DISCORD_BOT_TOKEN não configurada no Environment do Render!`);
+} else {
+  client.login(process.env.DISCORD_BOT_TOKEN);
+}
