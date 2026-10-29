@@ -56,6 +56,8 @@ const PREFIX = "!";
 const BOT_ACTIVITY_TYPE = ActivityType.Listening;
 const BOT_STATUS_TEXT = "/play para pedir sua música | Server do Ask";
 const REQUEST_CHANNEL_NAME = "🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞";
+const WELCOME_CHANNEL_NAME = "🕷️•𝕭𝖊𝖒-𝖛𝖎𝖓𝖉𝖔𝖘";
+const WELCOME_MESSAGE_TEXT = "Seja muito bem-vindo(a) ao **Server do Ask**! Puxe uma cadeira, entre nas calls para curtir um som e jogar com a galera, e sinta-se em casa!";
 const ELO_PANEL_CHANNEL_NAME = "🕷️•𝕰𝖑𝖔";
 const TICKET_PANEL_CHANNEL_NAME = "🕷️•𝕿𝖎𝖈𝖐𝖊𝖙𝖘";
 const RANKUP_CHANNEL_NAME = "upou-de-elo";
@@ -620,6 +622,83 @@ function normalizeChannelKey(raw = '') {
     .trim();
 }
 
+function isWelcomeChannel(channel) {
+  if (!channel || !channel.name || channel.isThread?.()) return false;
+  if (channel.name.startsWith('🔒-')) return false;
+  if (channel.name === WELCOME_CHANNEL_NAME) return true;
+  const normTarget = normalizeChannelKey(WELCOME_CHANNEL_NAME);
+  const normActual = normalizeChannelKey(channel.name);
+  return (
+    normActual === normTarget ||
+    normActual.endsWith('•bem-vindos') ||
+    normActual.endsWith('・bem-vindos') ||
+    normActual.endsWith('bem-vindos') ||
+    normActual.endsWith('bemvindos')
+  );
+}
+
+function findWelcomeChannel(guild) {
+  return guild.channels.cache.find(
+    (c) => c.isTextBased?.() && !c.isThread?.() && isWelcomeChannel(c)
+  );
+}
+
+function buildWelcomePayload(member) {
+  const eloChannel = findEloPanelChannel(member.guild);
+  const ticketChannel = findTicketPanelChannel(member.guild);
+  const eloRef = eloChannel ? `<#${eloChannel.id}>` : `**${ELO_PANEL_CHANNEL_NAME}**`;
+  const ticketRef = ticketChannel ? `<#${ticketChannel.id}>` : `**${TICKET_PANEL_CHANNEL_NAME}**`;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe11d48)
+    .setTitle('🕷️ Bem-vindo(a) ao Server do Ask!')
+    .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
+    .setDescription(
+      `Salve, <@${member.id}>! ${WELCOME_MESSAGE_TEXT}\n\n` +
+        `🎵 **Música nas Calls:** entre em uma call de voz e use \`/play\` para pedir sua música favorita.\n` +
+        `🏆 **Cargo de Elo (Privado):** passe em ${eloRef} para registrar seu elo do VALORANT (fica somente entre você e os Admins).\n` +
+        `🎫 **Suporte & Sugestões:** qualquer dúvida, sugestão ou denúncia privada, use ${ticketRef}.`
+    )
+    .setFooter({
+      text: `Membro #${member.guild.memberCount} · Server do Ask`,
+    })
+    .setTimestamp();
+
+  return {
+    content: `🕷️ Salve, <@${member.id}>! Seja muito bem-vindo(a) ao **Server do Ask**!`,
+    embeds: [embed],
+  };
+}
+
+async function sendWelcomeMessage(member) {
+  if (!member?.guild || member.user?.bot) return null;
+  let welcomeChannel = findWelcomeChannel(member.guild);
+  if (!welcomeChannel) {
+    await member.guild.channels.fetch().catch(() => null);
+    welcomeChannel = findWelcomeChannel(member.guild);
+  }
+  if (!welcomeChannel) {
+    console.warn(
+      `[${BOT_NAME}] Canal de boas-vindas "${WELCOME_CHANNEL_NAME}" não encontrado em ${member.guild.name}.`
+    );
+    return null;
+  }
+
+  try {
+    await welcomeChannel.send(buildWelcomePayload(member));
+    console.log(
+      `[${BOT_NAME}] Boas-vindas enviadas para ${member.user.tag} em #${welcomeChannel.name} (${member.guild.name})`
+    );
+    return welcomeChannel;
+  } catch (err) {
+    console.error(
+      `[${BOT_NAME}] Erro ao enviar boas-vindas em #${welcomeChannel.name}:`,
+      err.message
+    );
+    return null;
+  }
+}
+
 function isEloPanelChannel(channel) {
   if (!channel || !channel.name || channel.isThread?.()) return false;
   if (channel.name === ELO_PANEL_CHANNEL_NAME) return true;
@@ -1122,6 +1201,10 @@ const SLASH_COMMANDS_JSON = [
     .setDescription('Publica o painel fixo de tickets privados no canal configurado')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
+    .setName('testar-boas-vindas')
+    .setDescription('Envia uma mensagem de teste de boas-vindas no canal de boas-vindas configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
     .setName('vincular')
     .setDescription('Vincula sua conta Riot em modo privado (visível só para você e Admins)')
     .addStringOption((opt) => opt.setName('riotid').setDescription('Formato Nome#TAG').setRequired(true)),
@@ -1189,6 +1272,17 @@ client.on('messageCreate', async (message) => {
             : `Não encontrei o canal de texto **${TICKET_PANEL_CHANNEL_NAME}** neste servidor.`
         );
       }
+      return;
+    }
+
+    if (firstCmd === 'testar-boas-vindas' || firstCmd === 'boas-vindas') {
+      if (!isAdminOrMod(message.member)) return;
+      const sentIn = await sendWelcomeMessage(message.member);
+      await message.reply(
+        sentIn
+          ? `Mensagem de boas-vindas enviada com sucesso em <#${sentIn.id}>!`
+          : `Não encontrei o canal **${WELCOME_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio).`
+      );
       return;
     }
   }
@@ -1771,6 +1865,16 @@ client.on('interactionCreate', async (interaction) => {
     );
   }
 
+  if (interaction.commandName === 'testar-boas-vindas') {
+    await interaction.deferReply({ ephemeral: true });
+    const sentChannel = await sendWelcomeMessage(interaction.member);
+    return interaction.editReply(
+      sentChannel
+        ? `Mensagem de boas-vindas de teste enviada com sucesso em <#${sentChannel.id}>!`
+        : `Não encontrei o canal **${WELCOME_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio para o bot).`
+    );
+  }
+
   if (interaction.commandName === 'criar-cargos-valorant') {
     await interaction.deferReply({ ephemeral: true });
     const created = await ensureValorantRoles(interaction.guild, interaction.user.tag);
@@ -1958,6 +2062,11 @@ client.once('ready', async () => {
     await ensurePrivateEloNotice(guild, false);
     await ensureTicketPanelNotice(guild, false);
   }
+});
+
+client.on('guildMemberAdd', async (member) => {
+  if (member.user?.bot) return;
+  await sendWelcomeMessage(member);
 });
 
 client.on('guildCreate', async (guild) => {
