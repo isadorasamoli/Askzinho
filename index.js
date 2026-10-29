@@ -17,6 +17,7 @@ import { Readable } from 'node:stream';
 import { createRequire } from 'node:module';
 import {
   ActionRowBuilder,
+  ActivityType,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
@@ -52,6 +53,8 @@ const soundcloud = new Soundcloud();
 const BOT_NAME = "Askzinho";
 const PORT = Number(process.env.PORT) || 10000;
 const PREFIX = "!";
+const BOT_ACTIVITY_TYPE = ActivityType.Listening;
+const BOT_STATUS_TEXT = "/play para pedir sua música | Server do Ask";
 const REQUEST_CHANNEL_NAME = "🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞";
 const ELO_PANEL_CHANNEL_NAME = "🕷️•𝕰𝖑𝖔";
 const TICKET_PANEL_CHANNEL_NAME = "🕷️•𝕿𝖎𝖈𝖐𝖊𝖙𝖘";
@@ -133,7 +136,29 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
   ],
+  presence: {
+    status: 'online',
+    activities: [
+      {
+        name: BOT_STATUS_TEXT,
+        type: BOT_ACTIVITY_TYPE,
+      },
+    ],
+  },
 });
+
+function applyBotPresence() {
+  if (!client.user) return;
+  client.user.setPresence({
+    status: 'online',
+    activities: [
+      {
+        name: BOT_STATUS_TEXT,
+        type: BOT_ACTIVITY_TYPE,
+      },
+    ],
+  });
+}
 
 // Servidor HTTP Keep-Alive obrigatório para Render (Web Service Free) + ping do UptimeRobot
 const keepAliveServer = http.createServer((req, res) => {
@@ -1889,6 +1914,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 setInterval(async () => {
+  applyBotPresence();
   for (const account of linkedAccounts.values()) {
     const rankData = await fetchValorantRank(account.region, account.riotName, account.riotTag);
     if (!rankData || rankData.tierOrder <= account.lastTierOrder) continue;
@@ -1924,6 +1950,7 @@ setInterval(async () => {
 
 // Sincroniza Slash Commands, aviso privado no canal de Elo e Painel de Tickets em TODOS os servidores
 client.once('ready', async () => {
+  applyBotPresence();
   console.log(`[${BOT_NAME}] Conectado no Discord como ${client.user.tag} em ${client.guilds.cache.size} servidor(es)`);
   console.log(generateDependencyReport());
   for (const guild of client.guilds.cache.values()) {
