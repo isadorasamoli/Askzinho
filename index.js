@@ -58,12 +58,29 @@ const BOT_STATUS_TEXT = "/play para pedir sua música | Server do Ask";
 const REQUEST_CHANNEL_NAME = "🕷️•𝔐𝔲́𝔰𝔦𝔠𝔞";
 const WELCOME_CHANNEL_NAME = "🕷️•𝕭𝖊𝖒-𝖛𝖎𝖓𝖉𝖔𝖘";
 const WELCOME_MESSAGE_TEXT = "Seja muito bem-vindo(a) ao **Server do Ask**! Puxe uma cadeira, entre nas calls para curtir um som e jogar com a galera, e sinta-se em casa!";
+const ANNOUNCEMENTS_CHANNEL_NAME = "🕷️•𝕬𝖛𝖎𝖘𝖔𝖘";
+const ANNOUNCEMENT_SIGNATURE = 'Comunicados & Recursos Oficiais — Server do Ask';
+const LIVE_ALERT_CHANNEL_NAME = "🕷️•𝕷𝖎𝖛𝖊";
+const TIKTOK_PROFILE_INPUT = "https://www.tiktok.com/@a1skzy";
+const TIKTOK_CHECK_INTERVAL_MS = 60 * 1000;
 const ELO_PANEL_CHANNEL_NAME = "🕷️•𝕰𝖑𝖔";
 const TICKET_PANEL_CHANNEL_NAME = "🕷️•𝕿𝖎𝖈𝖐𝖊𝖙𝖘";
 const RANKUP_CHANNEL_NAME = "upou-de-elo";
 const MODLOG_CHANNEL_NAME = "auditoria-mod";
 const DEFAULT_VOLUME = 40;
 const BLOCKED_TERMS = ["estourado","gemidao","999db","proibidão","áudio troll"];
+
+function extractTikTokHandle(rawInput) {
+  const raw = String(rawInput || '').trim();
+  if (!raw) return 'a1skzy';
+  const match = raw.match(/tiktok\.com\/@([A-Za-z0-9._-]+)/i);
+  if (match && match[1]) return match[1];
+  return raw.replace(/^@+/, '').split(/[/?#\s]/)[0].trim() || 'a1skzy';
+}
+
+const TIKTOK_USERNAME = extractTikTokHandle(TIKTOK_PROFILE_INPUT);
+const TIKTOK_PROFILE_URL = `https://www.tiktok.com/@${TIKTOK_USERNAME}`;
+const TIKTOK_LIVE_URL = `https://www.tiktok.com/@${TIKTOK_USERNAME}/live`;
 
 const VALORANT_ROLES = [
   {
@@ -129,6 +146,14 @@ const CUSTOM_PLAYLISTS = {
 
 const linkedAccounts = new Map();
 const guildQueues = new Map();
+const announcedGuildIds = new Set();
+const tiktokLiveState = {
+  isCurrentlyLive: false,
+  lastSessionKey: null,
+  offlineStreak: 0,
+  lastCheckedAt: null,
+};
+let tiktokCheckInFlight = false;
 
 const client = new Client({
   intents: [
@@ -173,6 +198,8 @@ const keepAliveServer = http.createServer((req, res) => {
         discordReady: client.isReady(),
         pingMs: client.ws.ping,
         activeCalls: guildQueues.size,
+        tiktokHandle: `@${TIKTOK_USERNAME}`,
+        tiktokLive: tiktokLiveState.isCurrentlyLive,
         uptimeSec: Math.floor(process.uptime()),
       })
     );
@@ -643,30 +670,42 @@ function findWelcomeChannel(guild) {
   );
 }
 
+async function canBotEmbedInChannel(guild, channel) {
+  const botMember = guild?.members?.me || (await guild?.members?.fetchMe?.().catch(() => null));
+  if (!botMember || typeof channel?.permissionsFor !== 'function') return true;
+  const perms = channel.permissionsFor(botMember);
+  return perms ? perms.has(PermissionFlagsBits.EmbedLinks) : true;
+}
+
 function buildWelcomePayload(member) {
   const eloChannel = findEloPanelChannel(member.guild);
   const ticketChannel = findTicketPanelChannel(member.guild);
   const eloRef = eloChannel ? `<#${eloChannel.id}>` : `**${ELO_PANEL_CHANNEL_NAME}**`;
   const ticketRef = ticketChannel ? `<#${ticketChannel.id}>` : `**${TICKET_PANEL_CHANNEL_NAME}**`;
 
+  const bodyLines =
+    `Salve, <@${member.id}>! ${WELCOME_MESSAGE_TEXT}\n\n` +
+    `🎵 **Música nas Calls:** entre em uma call de voz e use \`/play\` para pedir sua música favorita.\n` +
+    `🏆 **Cargo de Elo (Privado):** passe em ${eloRef} para registrar seu elo do VALORANT (fica somente entre você e os Admins).\n` +
+    `🎫 **Suporte & Sugestões:** qualquer dúvida, sugestão ou denúncia privada, use ${ticketRef}.`;
+
   const embed = new EmbedBuilder()
-    .setColor(0xe11d48)
+    .setColor(0x010101)
     .setTitle('🕷️ Bem-vindo(a) ao Server do Ask!')
     .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
-    .setDescription(
-      `Salve, <@${member.id}>! ${WELCOME_MESSAGE_TEXT}\n\n` +
-        `🎵 **Música nas Calls:** entre em uma call de voz e use \`/play\` para pedir sua música favorita.\n` +
-        `🏆 **Cargo de Elo (Privado):** passe em ${eloRef} para registrar seu elo do VALORANT (fica somente entre você e os Admins).\n` +
-        `🎫 **Suporte & Sugestões:** qualquer dúvida, sugestão ou denúncia privada, use ${ticketRef}.`
-    )
+    .setDescription(bodyLines)
     .setFooter({
       text: `Membro #${member.guild.memberCount} · Server do Ask`,
     })
     .setTimestamp();
 
+  const fullTextFallback = `🕷️ **Bem-vindo(a) ao Server do Ask!**\n\n${bodyLines}`;
+
   return {
-    content: `🕷️ Salve, <@${member.id}>! Seja muito bem-vindo(a) ao **Server do Ask**!`,
-    embeds: [embed],
+    embedPayload: {
+      embeds: [embed],
+    },
+    fullTextFallback,
   };
 }
 
@@ -685,17 +724,502 @@ async function sendWelcomeMessage(member) {
   }
 
   try {
-    await welcomeChannel.send(buildWelcomePayload(member));
+    const { embedPayload, fullTextFallback } = buildWelcomePayload(member);
+    const canEmbed = await canBotEmbedInChannel(member.guild, welcomeChannel);
+    let usedFallback = !canEmbed;
+
+    if (!canEmbed) {
+      await welcomeChannel.send({ content: fullTextFallback });
+    } else {
+      try {
+        const sentMsg = await welcomeChannel.send(embedPayload);
+        if (sentMsg && (!sentMsg.embeds || sentMsg.embeds.length === 0)) {
+          usedFallback = true;
+          await sentMsg.edit({ content: fullTextFallback, embeds: [] }).catch(() => null);
+        }
+      } catch {
+        usedFallback = true;
+        await welcomeChannel.send({ content: fullTextFallback });
+      }
+    }
+
     console.log(
       `[${BOT_NAME}] Boas-vindas enviadas para ${member.user.tag} em #${welcomeChannel.name} (${member.guild.name})`
     );
-    return welcomeChannel;
+    return { channel: welcomeChannel, usedFallback };
   } catch (err) {
     console.error(
       `[${BOT_NAME}] Erro ao enviar boas-vindas em #${welcomeChannel.name}:`,
       err.message
     );
     return null;
+  }
+}
+
+function isAnnouncementsChannel(channel) {
+  if (!channel || !channel.name || channel.isThread?.()) return false;
+  if (channel.name.startsWith('🔒-')) return false;
+  if (channel.name === ANNOUNCEMENTS_CHANNEL_NAME) return true;
+  const normTarget = normalizeChannelKey(ANNOUNCEMENTS_CHANNEL_NAME);
+  const normActual = normalizeChannelKey(channel.name);
+  return (
+    normActual === normTarget ||
+    normActual.endsWith('•avisos') ||
+    normActual.endsWith('・avisos') ||
+    normActual === 'avisos'
+  );
+}
+
+function findAnnouncementsChannel(guild) {
+  return guild.channels.cache.find(
+    (c) => c.isTextBased?.() && !c.isThread?.() && isAnnouncementsChannel(c)
+  );
+}
+
+function findMusicRequestChannel(guild) {
+  const normReq = normalizeChannelKey(REQUEST_CHANNEL_NAME);
+  return guild.channels.cache.find(
+    (c) =>
+      c.isTextBased?.() &&
+      !c.isThread?.() &&
+      (c.name === REQUEST_CHANNEL_NAME || normalizeChannelKey(c.name || '') === normReq)
+  );
+}
+
+function buildServerAnnouncementPayload(guild) {
+  const eloChannel = findEloPanelChannel(guild);
+  const ticketChannel = findTicketPanelChannel(guild);
+  const musicChannel = findMusicRequestChannel(guild);
+
+  const eloRef = eloChannel ? `<#${eloChannel.id}>` : `**${ELO_PANEL_CHANNEL_NAME}**`;
+  const ticketRef = ticketChannel ? `<#${ticketChannel.id}>` : `**${TICKET_PANEL_CHANNEL_NAME}**`;
+  const musicHint = musicChannel ? ` (ou peça pelo chat <#${musicChannel.id}>)` : '';
+
+  const detailsBody =
+    `Salve, galera! Para todo mundo que **já está aqui no Server do Ask**, ativamos novos recursos oficiais para organizar os cargos, animar as calls e facilitar o contato com a Staff:\n\n` +
+    `🏆 **1. Registro de Elo do VALORANT (100% Privado)**\n` +
+    `Quem já faz parte do servidor já pode registrar seu elo lá em ${eloRef}! Basta clicar nos botões do canal para vincular sua Riot ID ou selecionar seu elo — **o envio fica 100% privado somente entre você e os Admins**, e seu cargo é atualizado na hora.\n\n` +
+    `🎵 **2. Bot de Música Liberado nas Calls**\n` +
+    `O bot está pronto para tocar música nas calls de voz! Entre em uma call e use \`/play\` com o nome da música ou link (YouTube, Spotify ou SoundCloud)${musicHint}. Comandos úteis: \`/skip\`, \`/volume\` e \`/stop\`.\n\n` +
+    `🎫 **3. Tickets Privados (Dúvidas, Sugestões e Denúncias)**\n` +
+    `Precisa **tirar alguma dúvida**, mandar uma **sugestão** para o servidor ou fazer uma **denúncia privada** sobre algum membro? Vá até ${ticketRef} e clique no botão correspondente para abrir uma sala confidencial direto com os Admins!`;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe11d48)
+    .setTitle(`📢 ${ANNOUNCEMENT_SIGNATURE}`)
+    .setDescription(detailsBody)
+    .setFooter({ text: 'Server do Ask · Administração Oficial' })
+    .setTimestamp();
+
+  const fullTextFallback =
+    `📢 @everyone — **${ANNOUNCEMENT_SIGNATURE}**\n\n` + detailsBody;
+
+  return {
+    embedPayload: {
+      content:
+        '📢 @everyone **Atenção, membros do Server do Ask!** Confiram os recursos oficiais disponíveis para quem já está no servidor:',
+      embeds: [embed],
+      allowedMentions: { parse: ['everyone'] },
+    },
+    fullTextFallback,
+  };
+}
+
+async function ensureServerAnnouncement(guild, forceRepost = false, targetChannel = null) {
+  if (!guild) return null;
+  let announcementsChannel = targetChannel || findAnnouncementsChannel(guild);
+  if (!announcementsChannel) {
+    await guild.channels.fetch().catch(() => null);
+    announcementsChannel = findAnnouncementsChannel(guild);
+  }
+  if (!announcementsChannel) return null;
+
+  if (!forceRepost) {
+    if (announcedGuildIds.has(guild.id)) {
+      return { channel: announcementsChannel, alreadyPosted: true, usedFallback: false };
+    }
+    const recent = await announcementsChannel.messages.fetch({ limit: 30 }).catch(() => null);
+    if (!recent) {
+      console.warn(
+        `[${BOT_NAME}] Sem permissão de Ler Histórico em #${announcementsChannel.name}; pulando envio automático de @everyone para evitar repetição. Use /aviso-geral para publicar.`
+      );
+      return null;
+    }
+    const alreadyExists = recent.some(
+      (m) =>
+        m.author?.id === client.user?.id &&
+        (m.content?.includes(ANNOUNCEMENT_SIGNATURE) ||
+          m.embeds?.some((e) => e.title?.includes(ANNOUNCEMENT_SIGNATURE)))
+    );
+    if (alreadyExists) {
+      announcedGuildIds.add(guild.id);
+      return { channel: announcementsChannel, alreadyPosted: true, usedFallback: false };
+    }
+  }
+
+  try {
+    const { embedPayload, fullTextFallback } = buildServerAnnouncementPayload(guild);
+    const canEmbed = await canBotEmbedInChannel(guild, announcementsChannel);
+    let usedFallback = !canEmbed;
+
+    if (!canEmbed) {
+      await announcementsChannel.send({
+        content: fullTextFallback,
+        allowedMentions: { parse: ['everyone'] },
+      });
+    } else {
+      const sentMsg = await announcementsChannel.send(embedPayload);
+      if (sentMsg && (!sentMsg.embeds || sentMsg.embeds.length === 0)) {
+        usedFallback = true;
+        await sentMsg
+          .edit({
+            content: fullTextFallback,
+            embeds: [],
+            allowedMentions: { parse: ['everyone'] },
+          })
+          .catch(() => null);
+      }
+    }
+
+    announcedGuildIds.add(guild.id);
+    console.log(
+      `[${BOT_NAME}] Comunicado @everyone publicado em #${announcementsChannel.name} (${guild.name})`
+    );
+    return { channel: announcementsChannel, alreadyPosted: false, usedFallback };
+  } catch (err) {
+    console.error(
+      `[${BOT_NAME}] Erro ao enviar comunicado em #${announcementsChannel.name}:`,
+      err.message
+    );
+    return null;
+  }
+}
+
+// ============================================================================
+// MONITORAMENTO AUTOMÁTICO DE LIVE NO TIKTOK (🕷️•𝕷𝖎𝖛𝖊)
+// ============================================================================
+
+function isLiveAlertChannel(channel) {
+  if (!channel || !channel.name || channel.isThread?.()) return false;
+  if (channel.name.startsWith('🔒-')) return false;
+  if (channel.name === LIVE_ALERT_CHANNEL_NAME) return true;
+  const normTarget = normalizeChannelKey(LIVE_ALERT_CHANNEL_NAME);
+  const normActual = normalizeChannelKey(channel.name);
+  return (
+    normActual === normTarget ||
+    normActual.endsWith('•live') ||
+    normActual.endsWith('・live') ||
+    normActual.endsWith('•lives') ||
+    normActual === 'live'
+  );
+}
+
+function findLiveAlertChannel(guild) {
+  return guild.channels.cache.find(
+    (c) => c.isTextBased?.() && !c.isThread?.() && isLiveAlertChannel(c)
+  );
+}
+
+async function fetchTikTokLiveStatus(username = TIKTOK_USERNAME) {
+  const cleanHandle = extractTikTokHandle(username);
+  const liveUrl = `https://www.tiktok.com/@${cleanHandle}/live`;
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  };
+
+  const res = await fetch(`${liveUrl}?_t=${Date.now()}`, {
+    headers,
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ao consultar TikTok Live (@${cleanHandle})`);
+  }
+
+  const html = await res.text();
+  let roomStatus = 0;
+  let roomId = '';
+  let title = '';
+  let nickname = cleanHandle;
+  let avatarUrl = '';
+  let coverUrl = '';
+  let startTime = 0;
+  let viewerCount = 0;
+  let hasStructuredData = false;
+
+  const sigiMatch = html.match(/<script id="SIGI_STATE"[^>]*>([\s\S]*?)<\/script>/i);
+  if (sigiMatch && sigiMatch[1]) {
+    try {
+      const sigi = JSON.parse(sigiMatch[1]);
+      const info = sigi?.LiveRoom?.liveRoomUserInfo;
+      if (info) {
+        hasStructuredData = true;
+        roomStatus = Number(info?.liveRoom?.status ?? info?.user?.status ?? 0);
+        roomId = String(info?.user?.roomId || info?.liveRoom?.roomId || '');
+        title = String(info?.liveRoom?.title || '').trim();
+        nickname = String(info?.user?.nickname || cleanHandle).trim();
+        avatarUrl = String(info?.user?.avatarLarger || info?.user?.avatarMedium || '');
+        coverUrl = String(info?.liveRoom?.coverUrl || '');
+        startTime = Number(info?.liveRoom?.startTime || 0);
+        viewerCount = Number(info?.liveRoom?.liveRoomStats?.userCount || 0);
+      }
+    } catch {}
+  }
+
+  if (!hasStructuredData) {
+    const rehydMatch = html.match(
+      /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i
+    );
+    if (rehydMatch && rehydMatch[1]) {
+      try {
+        const rehyd = JSON.parse(rehydMatch[1]);
+        const scope = rehyd?.__DEFAULT_SCOPE__ || {};
+        const liveDetail = scope['webapp.live-detail'] || scope['webapp.user-detail'];
+        const userObj = liveDetail?.userInfo?.user || liveDetail?.liveRoomUserInfo?.user;
+        const roomObj = liveDetail?.liveRoomUserInfo?.liveRoom;
+        if (userObj || roomObj) {
+          hasStructuredData = true;
+          roomStatus = Number(roomObj?.status ?? userObj?.status ?? 0);
+          roomId = String(userObj?.roomId || '');
+          title = String(roomObj?.title || '').trim();
+          nickname = String(userObj?.nickname || cleanHandle).trim();
+          avatarUrl = String(userObj?.avatarLarger || '');
+          coverUrl = String(roomObj?.coverUrl || '');
+          startTime = Number(roomObj?.startTime || 0);
+        }
+      } catch {}
+    }
+  }
+
+  if (!roomId) {
+    const roomRegex = html.match(/"roomId"\s*:\s*"(\d{10,25})"/);
+    if (roomRegex && roomRegex[1]) {
+      roomId = roomRegex[1];
+    }
+  }
+
+  let isLive = roomStatus === 2;
+
+  if (roomId && (isLive || !hasStructuredData)) {
+    try {
+      const aliveRes = await fetch(
+        `https://webcast.tiktok.com/webcast/room/check_alive/?aid=1988&region=BR&room_ids=${roomId}`,
+        {
+          headers: { 'User-Agent': headers['User-Agent'] },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (aliveRes.ok) {
+        const aliveJson = await aliveRes.json();
+        const entry = aliveJson?.data?.[0];
+        if (entry && typeof entry.alive === 'boolean') {
+          isLive = hasStructuredData ? isLive && entry.alive : entry.alive;
+        }
+      }
+    } catch {}
+  }
+
+  return {
+    isLive,
+    username: cleanHandle,
+    nickname,
+    title,
+    roomId,
+    startTime,
+    viewerCount,
+    avatarUrl,
+    coverUrl,
+    liveUrl,
+    profileUrl: `https://www.tiktok.com/@${cleanHandle}`,
+  };
+}
+
+function buildTikTokLivePayload(liveInfo, options = {}) {
+  const mentionEveryone = options.mentionEveryone !== false;
+  const isTest = Boolean(options.isTest);
+  const cleanHandle = liveInfo?.username || TIKTOK_USERNAME;
+  const displayNick = liveInfo?.nickname || cleanHandle;
+  const streamTitle =
+    liveInfo?.title?.trim() || 'Jogando e trocando ideia ao vivo com a galera!';
+  const liveUrl = `https://www.tiktok.com/@${cleanHandle}/live`;
+  const roomTag = liveInfo?.roomId ? `#${String(liveInfo.roomId).slice(-6)}` : '';
+  const mentionPrefix = mentionEveryone ? '@everyone ' : '';
+  const testBadge = isTest ? ' *(Mensagem de Teste)*' : '';
+  const allowedMentions = mentionEveryone ? { parse: ['everyone'] } : { parse: [] };
+
+  const linkRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel(`Assistir Live de @${cleanHandle} no TikTok`)
+      .setStyle(ButtonStyle.Link)
+      .setURL(liveUrl)
+      .setEmoji('🔴')
+  );
+
+  const descriptionLines =
+    `Salve, galera do **Server do Ask**! A live de **${displayNick}** (\`@${cleanHandle}\`) acabou de abrir no TikTok! Cola lá pra fortalecer, deixar o like e acompanhar ao vivo:\n\n` +
+    `🎬 **Título da Live:** ${streamTitle}\n` +
+    (liveInfo?.viewerCount > 0
+      ? `👀 **Assistindo agora:** ${liveInfo.viewerCount} pessoa(s)\n`
+      : '') +
+    `🔗 **Entrar agora:** ${liveUrl}`;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x010101)
+    .setTitle(`🔴 LIVE ON NO TIKTOK — @${cleanHandle}!${testBadge}`)
+    .setURL(liveUrl)
+    .setDescription(descriptionLines)
+    .setFooter({
+      text: `Server do Ask · TikTok Live (@${cleanHandle})${roomTag ? ` · ${roomTag}` : ''}`,
+    })
+    .setTimestamp();
+
+  if (liveInfo?.avatarUrl && /^https?:\/\//i.test(liveInfo.avatarUrl)) {
+    embed.setThumbnail(liveInfo.avatarUrl);
+  }
+  if (liveInfo?.coverUrl && /^https?:\/\//i.test(liveInfo.coverUrl)) {
+    embed.setImage(liveInfo.coverUrl);
+  }
+
+  const fullTextFallback =
+    `🔴 ${mentionPrefix}**LIVE ON NO TIKTOK — @${cleanHandle}!${testBadge}**\n\n` +
+    descriptionLines +
+    (roomTag ? `\n*(Sessão ${roomTag})*` : '');
+
+  return {
+    embedPayload: {
+      content: `🔴 ${mentionPrefix}**@${cleanHandle} está AO VIVO no TikTok!**${testBadge} Cola na live: ${liveUrl}`,
+      embeds: [embed],
+      components: [linkRow],
+      allowedMentions,
+    },
+    fullTextFallback,
+    components: [linkRow],
+    allowedMentions,
+  };
+}
+
+async function hasRecentTikTokAlertInChannel(liveChannel, liveInfo) {
+  const recent = await liveChannel.messages.fetch({ limit: 15 }).catch(() => null);
+  if (!recent) return false;
+  const roomTag = liveInfo?.roomId ? `#${String(liveInfo.roomId).slice(-6)}` : '';
+  const minTimestamp =
+    liveInfo?.startTime > 0
+      ? liveInfo.startTime * 1000 - 5 * 60 * 1000
+      : Date.now() - 2 * 60 * 60 * 1000;
+
+  return recent.some((m) => {
+    if (m.author?.id !== client.user?.id) return false;
+    const footerText = m.embeds?.[0]?.footer?.text || '';
+    const titleText = m.embeds?.[0]?.title || '';
+    const fullContent = `${m.content || ''} ${titleText} ${footerText}`;
+    if (fullContent.includes('Mensagem de Teste')) return false;
+    if (roomTag && fullContent.includes(roomTag)) return true;
+    const isLiveAlertMsg =
+      fullContent.includes('LIVE ON NO TIKTOK') || fullContent.includes('está AO VIVO no TikTok');
+    return isLiveAlertMsg && m.createdTimestamp >= minTimestamp;
+  });
+}
+
+async function sendTikTokLiveAlertToGuild(guild, liveInfo, options = {}) {
+  if (!guild) return null;
+  let liveChannel = findLiveAlertChannel(guild);
+  if (!liveChannel) {
+    await guild.channels.fetch().catch(() => null);
+    liveChannel = findLiveAlertChannel(guild);
+  }
+  if (!liveChannel) return null;
+
+  if (!options.isTest && !options.forceSend) {
+    const alreadySent = await hasRecentTikTokAlertInChannel(liveChannel, liveInfo);
+    if (alreadySent) {
+      return { channel: liveChannel, alreadyPosted: true, usedFallback: false };
+    }
+  }
+
+  try {
+    const { embedPayload, fullTextFallback, components, allowedMentions } =
+      buildTikTokLivePayload(liveInfo, options);
+    const canEmbed = await canBotEmbedInChannel(guild, liveChannel);
+    let usedFallback = !canEmbed;
+
+    if (!canEmbed) {
+      await liveChannel.send({
+        content: fullTextFallback,
+        components,
+        allowedMentions,
+      });
+    } else {
+      const sentMsg = await liveChannel.send(embedPayload);
+      if (sentMsg && (!sentMsg.embeds || sentMsg.embeds.length === 0)) {
+        usedFallback = true;
+        await sentMsg
+          .edit({
+            content: fullTextFallback,
+            embeds: [],
+            components,
+            allowedMentions,
+          })
+          .catch(() => null);
+      }
+    }
+
+    console.log(
+      `[${BOT_NAME}] Alerta de TikTok Live (@${TIKTOK_USERNAME}) enviado em #${liveChannel.name} (${guild.name})`
+    );
+    return { channel: liveChannel, alreadyPosted: false, usedFallback };
+  } catch (err) {
+    console.error(
+      `[${BOT_NAME}] Erro ao enviar alerta de live em #${liveChannel.name}:`,
+      err.message
+    );
+    return null;
+  }
+}
+
+async function checkAndAnnounceTikTokLive() {
+  if (tiktokCheckInFlight || !client.isReady()) return null;
+  tiktokCheckInFlight = true;
+  try {
+    const status = await fetchTikTokLiveStatus(TIKTOK_USERNAME);
+    tiktokLiveState.lastCheckedAt = new Date().toISOString();
+
+    if (!status.isLive) {
+      tiktokLiveState.offlineStreak += 1;
+      if (tiktokLiveState.offlineStreak >= 3) {
+        tiktokLiveState.isCurrentlyLive = false;
+      }
+      return status;
+    }
+
+    tiktokLiveState.offlineStreak = 0;
+    const sessionKey =
+      status.roomId && status.startTime
+        ? `${status.roomId}:${status.startTime}`
+        : status.roomId || 'live-session';
+
+    if (tiktokLiveState.isCurrentlyLive && tiktokLiveState.lastSessionKey === sessionKey) {
+      return status;
+    }
+
+    for (const guild of client.guilds.cache.values()) {
+      await sendTikTokLiveAlertToGuild(guild, status, {
+        mentionEveryone: true,
+        isTest: false,
+      });
+    }
+
+    tiktokLiveState.isCurrentlyLive = true;
+    tiktokLiveState.lastSessionKey = sessionKey;
+    return status;
+  } catch (err) {
+    console.warn(`[${BOT_NAME}] Falha temporária ao checar TikTok Live (@${TIKTOK_USERNAME}):`, err.message);
+    return null;
+  } finally {
+    tiktokCheckInFlight = false;
   }
 }
 
@@ -1205,6 +1729,24 @@ const SLASH_COMMANDS_JSON = [
     .setDescription('Envia uma mensagem de teste de boas-vindas no canal de boas-vindas configurado')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
+    .setName('aviso-geral')
+    .setDescription('Publica o comunicado oficial com @everyone no canal de avisos configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('status-live')
+    .setDescription('Verifica agora se a live configurada no TikTok está aberta')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('testar-live')
+    .setDescription('Envia um alerta de teste da live do TikTok no canal configurado')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addBooleanOption((opt) =>
+      opt
+        .setName('mencionar_everyone')
+        .setDescription('Marcar @everyone neste envio? (padrão: Não)')
+        .setRequired(false)
+    ),
+  new SlashCommandBuilder()
     .setName('vincular')
     .setDescription('Vincula sua conta Riot em modo privado (visível só para você e Admins)')
     .addStringOption((opt) => opt.setName('riotid').setDescription('Formato Nome#TAG').setRequired(true)),
@@ -1277,12 +1819,79 @@ client.on('messageCreate', async (message) => {
 
     if (firstCmd === 'testar-boas-vindas' || firstCmd === 'boas-vindas') {
       if (!isAdminOrMod(message.member)) return;
-      const sentIn = await sendWelcomeMessage(message.member);
+      const result = await sendWelcomeMessage(message.member);
       await message.reply(
-        sentIn
-          ? `Mensagem de boas-vindas enviada com sucesso em <#${sentIn.id}>!`
+        result
+          ? `Mensagem de boas-vindas enviada com sucesso em <#${result.channel.id}>!${
+              result.usedFallback
+                ? ' *(Enviada em texto completo porque a permissão "Inserir links" está desativada no canal)*'
+                : ''
+            }`
           : `Não encontrei o canal **${WELCOME_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio).`
       );
+      return;
+    }
+
+    if (firstCmd === 'aviso-geral' || firstCmd === 'avisogeral' || firstCmd === 'anunciar') {
+      if (!isAdminOrMod(message.member)) return;
+      if (isAnnouncementsChannel(message.channel)) {
+        await message.delete().catch(() => null);
+      }
+      const result = await ensureServerAnnouncement(message.guild, true);
+      if (!isAnnouncementsChannel(message.channel)) {
+        await message.reply(
+          result
+            ? `Comunicado oficial com \`@everyone\` publicado em <#${result.channel.id}>!`
+            : `Não encontrei o canal **${ANNOUNCEMENTS_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio).`
+        );
+      }
+      return;
+    }
+
+    if (firstCmd === 'status-live' || firstCmd === 'live') {
+      if (!isAdminOrMod(message.member)) return;
+      const status = await fetchTikTokLiveStatus(TIKTOK_USERNAME).catch(() => null);
+      if (!status) {
+        await message.reply(`Não consegui consultar o TikTok de **@${TIKTOK_USERNAME}** agora. Tente novamente em instantes.`);
+        return;
+      }
+      if (status.isLive) {
+        await sendTikTokLiveAlertToGuild(message.guild, status, { mentionEveryone: true, isTest: false });
+        await message.reply(
+          `🔴 **@${TIKTOK_USERNAME} está AO VIVO agora no TikTok!** (${status.liveUrl}) — o canal **${LIVE_ALERT_CHANNEL_NAME}** já foi sincronizado.`
+        );
+      } else {
+        await message.reply(
+          `⚫ **@${TIKTOK_USERNAME}** está offline no momento (${TIKTOK_PROFILE_URL}). O bot segue monitorando automaticamente a cada 60s para avisar em **${LIVE_ALERT_CHANNEL_NAME}**!`
+        );
+      }
+      return;
+    }
+
+    if (firstCmd === 'testar-live' || firstCmd === 'aviso-live') {
+      if (!isAdminOrMod(message.member)) return;
+      if (isLiveAlertChannel(message.channel)) {
+        await message.delete().catch(() => null);
+      }
+      const liveStatus = (await fetchTikTokLiveStatus(TIKTOK_USERNAME).catch(() => null)) || {
+        username: TIKTOK_USERNAME,
+        nickname: TIKTOK_USERNAME,
+        title: 'Jogando VALORANT e trocando ideia ao vivo!',
+        liveUrl: TIKTOK_LIVE_URL,
+      };
+      const pingEveryone = firstCmd === 'aviso-live';
+      const sent = await sendTikTokLiveAlertToGuild(message.guild, liveStatus, {
+        mentionEveryone: pingEveryone,
+        isTest: !pingEveryone,
+        forceSend: true,
+      });
+      if (!isLiveAlertChannel(message.channel)) {
+        await message.reply(
+          sent
+            ? `Alerta de live do TikTok enviado em <#${sent.channel.id}>!`
+            : `Não encontrei o canal **${LIVE_ALERT_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio).`
+        );
+      }
       return;
     }
   }
@@ -1867,11 +2476,81 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'testar-boas-vindas') {
     await interaction.deferReply({ ephemeral: true });
-    const sentChannel = await sendWelcomeMessage(interaction.member);
+    const result = await sendWelcomeMessage(interaction.member);
     return interaction.editReply(
-      sentChannel
-        ? `Mensagem de boas-vindas de teste enviada com sucesso em <#${sentChannel.id}>!`
+      result
+        ? `Mensagem de boas-vindas de teste enviada com sucesso em <#${result.channel.id}>!${
+            result.usedFallback
+              ? '\n💡 *Dica: como o bot estava sem a permissão **"Inserir links" (Embed Links)** nesse canal, enviei o guia completo em texto formatado. Se quiser com card preto e foto, basta liberar "Inserir links" para o bot no canal!*'
+              : ''
+          }`
         : `Não encontrei o canal **${WELCOME_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio para o bot).`
+    );
+  }
+
+  if (interaction.commandName === 'aviso-geral') {
+    await interaction.deferReply({ ephemeral: true });
+    const result = await ensureServerAnnouncement(interaction.guild, true);
+    return interaction.editReply(
+      result
+        ? `Comunicado oficial com \`@everyone\` publicado com sucesso em <#${result.channel.id}>!${
+            result.usedFallback
+              ? '\n💡 *Nota: enviado em modo texto completo porque a permissão **"Inserir links"** está desativada para o bot no canal.*'
+              : ''
+          }`
+        : `Não encontrei o canal **${ANNOUNCEMENTS_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio para o bot).`
+    );
+  }
+
+  if (interaction.commandName === 'status-live') {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const status = await fetchTikTokLiveStatus(TIKTOK_USERNAME);
+      if (status.isLive) {
+        const sent = await sendTikTokLiveAlertToGuild(interaction.guild, status, {
+          mentionEveryone: true,
+          isTest: false,
+        });
+        return interaction.editReply(
+          `🔴 **@${TIKTOK_USERNAME} está AO VIVO AGORA!**\n` +
+            `🎬 **Título:** ${status.title || 'Ao vivo no TikTok'}\n` +
+            `🔗 **Link:** ${status.liveUrl}\n` +
+            (sent ? `📢 Canal <#${sent.channel.id}> verificado/atualizado!` : `⚠️ Canal **${LIVE_ALERT_CHANNEL_NAME}** não encontrado.`)
+        );
+      }
+      return interaction.editReply(
+        `⚫ **@${TIKTOK_USERNAME}** está offline neste momento (${TIKTOK_PROFILE_URL}).\n` +
+          `📡 O monitoramento automático a cada **60 segundos** está ativo e avisará em **${LIVE_ALERT_CHANNEL_NAME}** assim que a live abrir!`
+      );
+    } catch (err) {
+      return interaction.editReply(
+        `Não consegui consultar o TikTok agora (\`${err.message}\`). O bot tentará novamente automaticamente em 60s.`
+      );
+    }
+  }
+
+  if (interaction.commandName === 'testar-live') {
+    await interaction.deferReply({ ephemeral: true });
+    const pingEveryone = Boolean(interaction.options.getBoolean('mencionar_everyone'));
+    const liveStatus = (await fetchTikTokLiveStatus(TIKTOK_USERNAME).catch(() => null)) || {
+      username: TIKTOK_USERNAME,
+      nickname: TIKTOK_USERNAME,
+      title: 'Jogando VALORANT e trocando ideia ao vivo!',
+      liveUrl: TIKTOK_LIVE_URL,
+    };
+    const result = await sendTikTokLiveAlertToGuild(interaction.guild, liveStatus, {
+      mentionEveryone: pingEveryone,
+      isTest: !pingEveryone,
+      forceSend: true,
+    });
+    return interaction.editReply(
+      result
+        ? `Alerta de live do TikTok (\`@${TIKTOK_USERNAME}\`) enviado com sucesso em <#${result.channel.id}>!${
+            result.usedFallback
+              ? '\n💡 *Dica: libere **"Inserir links"** para o bot no canal se quiser exibir o card preto com a capa da live.*'
+              : ''
+          }`
+        : `Não encontrei o canal **${LIVE_ALERT_CHANNEL_NAME}** neste servidor (ou faltam permissões de envio para o bot).`
     );
   }
 
@@ -2061,7 +2740,11 @@ client.once('ready', async () => {
     await syncSlashCommandsForGuild(guild.id, guild.name);
     await ensurePrivateEloNotice(guild, false);
     await ensureTicketPanelNotice(guild, false);
+    await ensureServerAnnouncement(guild, false);
   }
+  console.log(`[${BOT_NAME}] Monitorando lives de ${TIKTOK_PROFILE_URL} a cada 60s -> canal "${LIVE_ALERT_CHANNEL_NAME}"`);
+  setTimeout(() => checkAndAnnounceTikTokLive(), 5000);
+  setInterval(() => checkAndAnnounceTikTokLive(), TIKTOK_CHECK_INTERVAL_MS);
 });
 
 client.on('guildMemberAdd', async (member) => {
@@ -2074,6 +2757,7 @@ client.on('guildCreate', async (guild) => {
   await syncSlashCommandsForGuild(guild.id, guild.name);
   await ensurePrivateEloNotice(guild, false);
   await ensureTicketPanelNotice(guild, false);
+  await ensureServerAnnouncement(guild, false);
 });
 
 client.on('channelCreate', async (channel) => {
@@ -2084,6 +2768,9 @@ client.on('channelCreate', async (channel) => {
   if (isTicketPanelChannel(channel)) {
     await ensureTicketPanelNotice(channel.guild, false, channel);
   }
+  if (isAnnouncementsChannel(channel)) {
+    await ensureServerAnnouncement(channel.guild, false, channel);
+  }
 });
 
 client.on('channelUpdate', async (oldChannel, newChannel) => {
@@ -2093,6 +2780,9 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
   }
   if (!isTicketPanelChannel(oldChannel) && isTicketPanelChannel(newChannel)) {
     await ensureTicketPanelNotice(newChannel.guild, false, newChannel);
+  }
+  if (!isAnnouncementsChannel(oldChannel) && isAnnouncementsChannel(newChannel)) {
+    await ensureServerAnnouncement(newChannel.guild, false, newChannel);
   }
 });
 
