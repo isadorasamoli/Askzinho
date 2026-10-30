@@ -25,6 +25,7 @@ import {
   EmbedBuilder,
   GatewayIntentBits,
   ModalBuilder,
+  OverwriteType,
   PermissionFlagsBits,
   REST,
   Routes,
@@ -1237,14 +1238,128 @@ function findEloPanelChannel(guild) {
   );
 }
 
+const STAFF_ROLE_NAME_REGEX =
+  /\b(admin|administrador|administracao|adm|staff|mod|moderador|moderacao|suporte|dono|owner|gerente|lider)\b/i;
+
+function isStaffRole(role, guildId) {
+  if (!role || role.id === guildId || role.managed) return false;
+  if (
+    role.permissions?.has(PermissionFlagsBits.Administrator) ||
+    role.permissions?.has(PermissionFlagsBits.ManageGuild) ||
+    role.permissions?.has(PermissionFlagsBits.ManageChannels) ||
+    role.permissions?.has(PermissionFlagsBits.ManageRoles) ||
+    role.permissions?.has(PermissionFlagsBits.ModerateMembers) ||
+    role.permissions?.has(PermissionFlagsBits.KickMembers) ||
+    role.permissions?.has(PermissionFlagsBits.BanMembers)
+  ) {
+    return true;
+  }
+  const normalizedRoleName = normalizeChannelKey(role.name || '');
+  return STAFF_ROLE_NAME_REGEX.test(normalizedRoleName);
+}
+
 function isAdminOrMod(member) {
-  if (!member?.permissions) return false;
-  return (
-    member.permissions.has(PermissionFlagsBits.Administrator) ||
-    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
-    member.permissions.has(PermissionFlagsBits.ManageRoles) ||
-    member.permissions.has(PermissionFlagsBits.ModerateMembers)
+  if (!member) return false;
+  if (member.guild?.ownerId && member.id === member.guild.ownerId) return true;
+  if (
+    member.permissions?.has(PermissionFlagsBits.Administrator) ||
+    member.permissions?.has(PermissionFlagsBits.ManageGuild) ||
+    member.permissions?.has(PermissionFlagsBits.ManageChannels) ||
+    member.permissions?.has(PermissionFlagsBits.ManageRoles) ||
+    member.permissions?.has(PermissionFlagsBits.ModerateMembers) ||
+    member.permissions?.has(PermissionFlagsBits.KickMembers) ||
+    member.permissions?.has(PermissionFlagsBits.BanMembers)
+  ) {
+    return true;
+  }
+  return Boolean(member.roles?.cache?.some((r) => isStaffRole(r, member.guild?.id)));
+}
+
+async function resolveGuildStaffAccess(guild) {
+  if (!guild) {
+    return { ownerId: null, staffRoles: [], staffMemberIds: [], botRoleId: null, botMember: null };
+  }
+  if (!guild.roles.cache.size) {
+    await guild.roles.fetch().catch(() => null);
+  }
+
+  let ownerId = guild.ownerId || null;
+  if (!ownerId) {
+    const ownerMember = await guild.fetchOwner().catch(() => null);
+    ownerId = ownerMember?.id || null;
+  }
+
+  const staffRoles = Array.from(
+    guild.roles.cache.filter((r) => isStaffRole(r, guild.id)).values()
+  ).slice(0, 15);
+
+  await Promise.race([
+    guild.members.fetch(),
+    new Promise((resolve) => setTimeout(resolve, 4000)),
+  ]).catch(() => null);
+
+  if (ownerId && !guild.members.cache.has(ownerId)) {
+    await guild.members.fetch(ownerId).catch(() => null);
+  }
+
+  const staffMemberIds = [];
+  if (ownerId) staffMemberIds.push(ownerId);
+  for (const m of guild.members.cache.values()) {
+    if (m.user?.bot) continue;
+    if (isAdminOrMod(m) && !staffMemberIds.includes(m.id)) {
+      staffMemberIds.push(m.id);
+    }
+    if (staffMemberIds.length >= 20) break;
+  }
+
+  const botMember = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  const botRoleId = botMember?.roles?.botRole?.id || null;
+
+  return { ownerId, staffRoles, staffMemberIds, botRoleId, botMember };
+}
+
+async function addStaffAndOwnerToPrivateThread(guild, thread, extraUserIds = []) {
+  if (!guild || !thread) return;
+  await thread.join?.().catch(() => null);
+  const { ownerId, staffMemberIds } = await resolveGuildStaffAccess(guild);
+  const allTargets = Array.from(
+    new Set([...extraUserIds, ...(ownerId ? [ownerId] : []), ...staffMemberIds].filter(Boolean))
   );
+  for (const userId of allTargets) {
+    await thread.members.add(userId).catch(() => null);
+  }
+}
+
+function buildStaffMentionData(staffAccess, authorId = null) {
+  const tokens = [];
+  if (staffAccess?.ownerId) {
+    tokens.push(`<@${staffAccess.ownerId}>`);
+  }
+  for (const role of (staffAccess?.staffRoles || []).slice(0, 5)) {
+    tokens.push(`<@&${role.id}>`);
+  }
+  if (tokens.length === 0) {
+    for (const uid of (staffAccess?.staffMemberIds || []).slice(0, 5)) {
+      tokens.push(`<@${uid}>`);
+    }
+  }
+  const allowedUsers = Array.from(
+    new Set(
+      [
+        ...(authorId ? [authorId] : []),
+        ...(staffAccess?.ownerId ? [staffAccess.ownerId] : []),
+        ...(staffAccess?.staffMemberIds || []).slice(0, 10),
+      ].filter(Boolean)
+    )
+  );
+  const allowedRoles = (staffAccess?.staffRoles || []).slice(0, 10).map((r) => r.id);
+  return {
+    mentionText: tokens.join(' '),
+    allowedMentions: {
+      users: allowedUsers,
+      roles: allowedRoles,
+    },
+  };
 }
 
 function buildPrivateEloNoticePayload() {
@@ -1330,7 +1445,7 @@ async function openOrGetPrivateAdminEloThread(guild, member) {
       await thread.setArchived(false).catch(() => null);
     }
 
-    await thread.members.add(member.id).catch(() => null);
+    await addStaffAndOwnerToPrivateThread(guild, thread, [member.id]);
     return thread;
   } catch (err) {
     console.warn(`[${BOT_NAME}] Aviso ao criar sala privada de elo:`, err.message);
@@ -1588,70 +1703,130 @@ function buildTicketModal(rawType) {
   return modal;
 }
 
+function buildConfidentialChannelOverwrites(guild, memberId, staffAccess) {
+  const { ownerId, staffRoles, staffMemberIds, botRoleId, botMember } = staffAccess;
+  const botPerms = botMember?.permissions;
+  const botIsAdmin = !botPerms || botPerms.has(PermissionFlagsBits.Administrator);
+  const safeAllow = (bits) => (botIsAdmin ? bits : bits.filter((bit) => botPerms.has(bit)));
+
+  const ensureView = (bits) =>
+    bits.includes(PermissionFlagsBits.ViewChannel)
+      ? bits
+      : [PermissionFlagsBits.ViewChannel, ...bits];
+
+  const memberAllowBits = ensureView(
+    safeAllow([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.SendMessagesInThreads,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks,
+    ])
+  );
+
+  const staffAllowBits = ensureView(
+    safeAllow([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.SendMessagesInThreads,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.ManageMessages,
+    ])
+  );
+
+  const botAllowBits = ensureView(
+    safeAllow([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.SendMessagesInThreads,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.ManageChannels,
+      PermissionFlagsBits.ManageMessages,
+      PermissionFlagsBits.MentionEveryone,
+    ])
+  );
+
+  const overwrites = [
+    {
+      id: guild.id,
+      type: OverwriteType.Role,
+      deny: [PermissionFlagsBits.ViewChannel],
+    },
+    {
+      id: memberId,
+      type: OverwriteType.Member,
+      allow: memberId === ownerId ? staffAllowBits : memberAllowBits,
+    },
+    {
+      id: client.user.id,
+      type: OverwriteType.Member,
+      allow: botAllowBits,
+    },
+  ];
+
+  if (botRoleId) {
+    overwrites.push({
+      id: botRoleId,
+      type: OverwriteType.Role,
+      allow: botAllowBits,
+    });
+  }
+
+  if (ownerId && ownerId !== memberId && ownerId !== client.user.id) {
+    overwrites.push({
+      id: ownerId,
+      type: OverwriteType.Member,
+      allow: staffAllowBits,
+    });
+  }
+
+  for (const role of staffRoles) {
+    overwrites.push({
+      id: role.id,
+      type: OverwriteType.Role,
+      allow: staffAllowBits,
+    });
+  }
+
+  for (const staffUserId of staffMemberIds) {
+    if (staffUserId === memberId || staffUserId === ownerId || staffUserId === client.user.id) {
+      continue;
+    }
+    if (overwrites.length >= 35) break;
+    overwrites.push({
+      id: staffUserId,
+      type: OverwriteType.Member,
+      allow: staffAllowBits,
+    });
+  }
+
+  return overwrites;
+}
+
 async function openPrivateTicketRoom(guild, member, fallbackChannel, tipo) {
   const safeUser =
     member.user.username.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 16) || 'membro';
   const channelName = `🔒-${tipo}-${safeUser}`;
   const topicPrefix = `ticket-owner:${member.id} | tipo:${tipo}`;
 
+  const staffAccess = await resolveGuildStaffAccess(guild);
+  const permissionOverwrites = buildConfidentialChannelOverwrites(guild, member.id, staffAccess);
+
   const existingChannel = guild.channels.cache.find(
     (c) => c.type === ChannelType.GuildText && c.topic?.startsWith(topicPrefix)
   );
-  if (existingChannel) return existingChannel;
+  if (existingChannel) {
+    await existingChannel.permissionOverwrites.set(permissionOverwrites).catch(() => null);
+    return existingChannel;
+  }
 
   const panelChannel = findTicketPanelChannel(guild);
   const parentId = panelChannel?.parentId || fallbackChannel?.parentId || undefined;
-
-  const staffRoles = Array.from(
-    guild.roles.cache
-      .filter(
-        (r) =>
-          r.id !== guild.id &&
-          !r.managed &&
-          (r.permissions.has(PermissionFlagsBits.Administrator) ||
-            r.permissions.has(PermissionFlagsBits.ManageGuild) ||
-            r.permissions.has(PermissionFlagsBits.ModerateMembers))
-      )
-      .values()
-  ).slice(0, 20);
-
-  const permissionOverwrites = [
-    {
-      id: guild.id,
-      deny: [PermissionFlagsBits.ViewChannel],
-    },
-    {
-      id: member.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.EmbedLinks,
-      ],
-    },
-    {
-      id: client.user.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.ManageMessages,
-        PermissionFlagsBits.EmbedLinks,
-      ],
-    },
-    ...staffRoles.map((role) => ({
-      id: role.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.ManageMessages,
-      ],
-    })),
-  ];
 
   try {
     const createdChannel = await guild.channels.create({
@@ -1663,23 +1838,45 @@ async function openPrivateTicketRoom(guild, member, fallbackChannel, tipo) {
       reason: `Ticket privado (${tipo}) aberto por ${member.user.tag}`,
     });
     return createdChannel;
-  } catch (err) {
+  } catch (firstErr) {
+    if (parentId) {
+      try {
+        const rootChannel = await guild.channels.create({
+          name: channelName,
+          type: ChannelType.GuildText,
+          topic: `${topicPrefix} | Ticket privado de ${member.user.tag}`,
+          permissionOverwrites,
+          reason: `Ticket privado (${tipo}) aberto por ${member.user.tag}`,
+        });
+        return rootChannel;
+      } catch {}
+    }
+
     console.warn(
-      `[${BOT_NAME}] Sem permissão ManageChannels para criar canal de ticket (${err.message}); usando PrivateThread.`
+      `[${BOT_NAME}] Sem permissão ManageChannels para criar canal de ticket (${firstErr.message}); usando PrivateThread com Dono + Admins.`
     );
     const hostChannel =
       panelChannel || (fallbackChannel?.type === ChannelType.GuildText ? fallbackChannel : null);
     if (!hostChannel || typeof hostChannel.threads?.create !== 'function') return null;
 
     try {
-      const thread = await hostChannel.threads.create({
-        name: channelName,
-        autoArchiveDuration: 1440,
-        type: ChannelType.PrivateThread,
-        invitable: false,
-        reason: `Ticket privado (${tipo}) aberto por ${member.user.tag}`,
-      });
-      await thread.members.add(member.id).catch(() => null);
+      const activeThreads = await hostChannel.threads.fetchActive().catch(() => null);
+      let thread = activeThreads?.threads.find(
+        (t) => t.name === channelName && t.type === ChannelType.PrivateThread
+      );
+      if (!thread) {
+        thread = await hostChannel.threads.create({
+          name: channelName,
+          autoArchiveDuration: 1440,
+          type: ChannelType.PrivateThread,
+          invitable: false,
+          reason: `Ticket privado (${tipo}) aberto por ${member.user.tag}`,
+        });
+      } else if (thread.archived) {
+        await thread.setArchived(false).catch(() => null);
+      }
+
+      await addStaffAndOwnerToPrivateThread(guild, thread, [member.id]);
       return thread;
     } catch (threadErr) {
       console.error(`[${BOT_NAME}] Falha ao criar tópico privado de ticket:`, threadErr.message);
@@ -2305,11 +2502,59 @@ client.on('interactionCreate', async (interaction) => {
         .setStyle(ButtonStyle.Secondary)
     );
 
-    await room.send({
-      content: `🔒 Atendimento privado de <@${interaction.user.id}> aberto para a administração:`,
-      embeds: [ticketEmbed],
-      components: [controlsRow],
-    });
+    const staffAccess = await resolveGuildStaffAccess(interaction.guild);
+    const { mentionText, allowedMentions } = buildStaffMentionData(
+      staffAccess,
+      interaction.user.id
+    );
+
+    const headerNotice =
+      `🔒 **Atendimento privado aberto por <@${interaction.user.id}>!**` +
+      (mentionText ? `\n👮 **Dono & Admins acionados:** ${mentionText}` : '');
+
+    const fullTicketTextFallback =
+      `${headerNotice}\n\n` +
+      `**${meta.label}**\n` +
+      `• **Autor:** <@${interaction.user.id}> (\`${interaction.user.tag}\`)\n` +
+      (accused ? `• **🚨 Membro Denunciado:** ${accused}\n` : '') +
+      `• **Assunto:** ${subject}\n` +
+      `• **Descrição Detalhada:** ${details}\n` +
+      (proof ? `• **Provas / Links:** ${proof}\n` : '') +
+      `\n*Somente você, o Dono do servidor, os Admins e o bot têm acesso a este canal.*`;
+
+    const canEmbedInRoom = await canBotEmbedInChannel(interaction.guild, room);
+    if (!canEmbedInRoom) {
+      await room.send({
+        content: fullTicketTextFallback,
+        components: [controlsRow],
+        allowedMentions,
+      });
+    } else {
+      try {
+        const sentTicketMsg = await room.send({
+          content: headerNotice,
+          embeds: [ticketEmbed],
+          components: [controlsRow],
+          allowedMentions,
+        });
+        if (sentTicketMsg && (!sentTicketMsg.embeds || sentTicketMsg.embeds.length === 0)) {
+          await sentTicketMsg
+            .edit({
+              content: fullTicketTextFallback,
+              embeds: [],
+              components: [controlsRow],
+              allowedMentions,
+            })
+            .catch(() => null);
+        }
+      } catch {
+        await room.send({
+          content: fullTicketTextFallback,
+          components: [controlsRow],
+          allowedMentions,
+        });
+      }
+    }
 
     await sendAuditLog(interaction.guild, {
       category: tipo === 'denuncia' ? 'MOD_SKIP' : 'TICKETS',
@@ -2321,7 +2566,7 @@ client.on('interactionCreate', async (interaction) => {
     });
 
     return interaction.editReply(
-      `🔒 Seu ticket privado (**${meta.label}**) foi aberto em <#${room.id}>! Somente você e os Admins do servidor têm acesso.`
+      `🔒 Seu ticket privado (**${meta.label}**) foi aberto em <#${room.id}>! O Dono do servidor e os Admins já foram notificados dentro da sala.`
     );
   }
 
